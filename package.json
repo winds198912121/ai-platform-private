@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "软件开发可视化平台 · 阶段门禁 + WBS 分解 + 逐模块单元测试与人工批准（零依赖）",
+  "description": "A local AI development platform with visual workflows, human review, code generation, and test execution.",
   "scripts": {
     "start": "node server.mjs",
     "test": "AI_PLATFORM_SPEED=0 node --test test/",
