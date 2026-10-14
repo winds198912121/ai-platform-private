@@ -2,6 +2,12 @@
 
 **A visual workspace for AI-assisted software delivery.**
 
+Coordinate specialized AI agents while people guide the work, review outputs, and approve each handoff.
+
+![DevFlow AI Software Delivery Team: human oversight, AI agents, and deliverables across the software delivery lifecycle](docs/assets/devflow-ai-delivery-team.png)
+
+[Download the HTML overview](https://github.com/winds198912121/ai-platform/raw/refs/heads/main/docs/DevFlow_AI_Delivery_Team_EN_v2.html) · [View the full-size image](docs/assets/devflow-ai-delivery-team.png)
+
 Turn a project brief into requirements, designs, a development plan, code, tests, and an operations runbook. Follow progress in a web dashboard and review each step before the workflow continues.
 
 The platform runs locally on Node.js with no npm dependencies. Generated code and test results are saved to your workspace.
