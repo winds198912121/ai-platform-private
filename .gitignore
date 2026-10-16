@@ -4,3 +4,5 @@ out/
 workspace/
 .DS_Store
 *.log
+setup/ai-platform.env
+setup/run/

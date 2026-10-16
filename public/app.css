@@ -164,12 +164,14 @@ body {
 
 .cmdk {
   justify-self: center; width: min(520px, 100%);
-  display: flex; align-items: center; gap: 8px;
+  display: grid; gap: 6px; min-width: 180px;
   border: 1px solid var(--line); background: var(--panel);
   padding: 6px 10px; border-radius: var(--radius);
   color: var(--muted); font: 400 12px/1 var(--font-ui);
 }
 .cmdk:hover { border-color: var(--line-2); }
+#liveText { font-size: 10px; line-height: 1.3; text-align: right; }
+#liveProgress:empty { display: none; }
 .cmdk kbd {
   margin-left: auto; font: 500 10px/1 var(--font-mono); color: var(--muted);
   border: 1px solid var(--line); border-radius: 2px; padding: 3px 5px; background: var(--panel-2);
@@ -282,6 +284,35 @@ body {
 .pill.acc  { color: var(--accent); background: var(--accent-dim); border-color: color-mix(in oklab, var(--accent) 40%, transparent); }
 .pill.bare { background: transparent; border-color: var(--line); color: var(--muted); }
 .pill.bare::before { display: none; }
+
+/* 执行进度：阶段、模块和顶栏共用真实执行节点，颜色保留失败/待审状态。 */
+.execution-progress { --progress-color: var(--run); display: grid; gap: 6px; min-width: 0; width: 100%; }
+.progress-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; line-height: 1.4; }
+.progress-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.progress-heading strong { color: var(--progress-color); font: 600 11px/1 var(--font-mono); font-variant-numeric: tabular-nums; }
+.execution-track { height: 8px; background: var(--panel-3); border-radius: 3px; overflow: hidden; }
+.execution-track > i { display: block; height: 100%; background: var(--progress-color); transition: width .25s ease; }
+.progress-phase { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.execution-progress[data-status="approved"] { --progress-color: var(--ok); }
+.execution-progress[data-status="awaiting_review"] { --progress-color: var(--warn); }
+.execution-progress[data-status="failed"] { --progress-color: var(--fail); }
+.execution-progress[data-status="failed"] .execution-track { background: var(--fail-dim); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--fail) 30%, transparent); }
+.execution-progress:is([data-status="pending"], [data-status="rejected"]) { --progress-color: var(--muted); }
+.execution-progress.compact { grid-template-columns: minmax(24px, 1fr) 34px; align-items: center; gap: 8px; }
+.execution-progress.compact .progress-heading { grid-column: 2; grid-row: 1; justify-content: flex-end; }
+.execution-progress.compact .progress-heading span { display: none; }
+.execution-progress.compact .execution-track { grid-column: 1; grid-row: 1; height: 6px; }
+.pipe-node .execution-progress { margin-top: 10px; }
+.mod-name { min-width: 0; display: grid; gap: 7px; }
+.tnode .execution-progress { width: 100px; }
+.g-dev > .card:first-child { container-type: inline-size; }
+@container (max-width: 600px) {
+  .g-dev .mod-row { grid-template-columns: 36px minmax(90px, 1fr) 82px; }
+  .g-dev .mod-row > :nth-child(4), .g-dev .mod-row > :nth-child(5) { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .execution-track > i { transition: none; } }
+.mod-row.run .mid, .mod-row.run .mn { color: var(--ink-1); }
+.mod-row.run { background: color-mix(in oklab, var(--accent) 6%, transparent); }
 
 .mono { font-family: var(--font-mono); font-feature-settings: var(--mono-num); }
 .muted { color: var(--muted); }
@@ -745,7 +776,7 @@ label.lb { display:block; font:500 10px/1 var(--font-mono); letter-spacing:.1em;
   .mod-row { grid-template-columns: 42px minmax(0, 1fr) 84px; }
   .mod-row > :nth-child(4), .mod-row > :nth-child(5) { display: none; }
   .topbar { grid-template-columns: 1fr auto; padding: 8px 14px; gap: 10px; }
-  .cmdk { display: none; }
+  .cmdk { grid-column: 1 / -1; grid-row: 2; width: 100%; }
   .page { padding: 14px 14px 32px; }
   .pipe-node { min-width: 84px; }
 }
@@ -768,3 +799,44 @@ label.lb { display:block; font:500 10px/1 var(--font-mono); letter-spacing:.1em;
   .navbtn { padding: 8px 4px; }
   .navbtn .badge { display: none; }
 }
+
+/* ---------- LLM 服务 / Settings ---------- */
+.set-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: var(--gap); }
+.set-card { display: flex; flex-direction: column; gap: 8px; position: relative; padding-right: 96px; }   /* 给右上角的 toggle 留位置 */
+.set-card .head { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; min-height: 26px; }
+.set-card .head .nm { font: 600 14px/1.3 var(--font-ui); letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.set-card .head .pill { font: 500 10px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; flex: 0 0 auto; }
+
+/* 右上角的 enabled 开关（iOS 风：滑块 + 文字） */
+.set-toggle { position: absolute; top: 14px; right: 14px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.set-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+.set-toggle-dot { width: 28px; height: 16px; background: var(--panel-3); border: 1px solid var(--line-2); border-radius: 999px; position: relative; transition: background .15s, border-color .15s; flex: 0 0 auto; }
+.set-toggle-dot::after { content: ''; position: absolute; top: 1px; left: 1px; width: 12px; height: 12px; background: var(--ink-2); border-radius: 50%; transition: transform .15s, background .15s; }
+.set-toggle input:checked + .set-toggle-dot { background: var(--accent-dim); border-color: var(--accent); }
+.set-toggle input:checked + .set-toggle-dot::after { transform: translateX(12px); background: var(--accent); }
+.set-toggle-text { font: 500 10px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+.set-toggle input:checked ~ .set-toggle-text { color: var(--accent); }
+.set-card .row { display: flex; align-items: center; gap: 8px; }
+.set-card .row > label.lb { min-width: 78px; font: 500 11px/1 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.set-card .row .field { flex: 1; }
+.set-card .hint { color: var(--muted); font: 400 11px/1.5 var(--font-mono); }
+.set-card .hint b { color: var(--ink-2); font-weight: 500; }
+.set-card .models-text { font: 400 12px/1.55 var(--font-mono); resize: vertical; min-height: 76px; max-height: 260px; padding: 8px 10px; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
+.set-card .models-count { font: 400 10px/1 var(--font-mono); color: var(--muted); margin-left: 4px; }
+.set-card .footer { display: flex; flex-direction: column; gap: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.set-card .footer-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.set-card .footer .preview { font: 400 11px/1.4 var(--font-mono); color: var(--muted); }
+.set-card .footer-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.set-card .footer .right { margin-left: auto; display: flex; gap: 6px; }
+.set-card .test-result { font: 500 11px/1.4 var(--font-mono); padding: 6px 10px; border-radius: var(--radius); border: 1px solid var(--line); }
+.set-card .test-result.ok { background: var(--ok-dim); border-color: var(--ok); color: var(--ok); }
+.set-card .test-result.fail { background: var(--fail-dim); border-color: var(--fail); color: var(--fail); }
+.set-card .test-result.pending { background: var(--run-dim); border-color: var(--run); color: var(--run); }
+.set-card .test-result .sample { color: var(--ink-2); display: block; margin-top: 4px; }
+.set-card input.field { font: 400 12px/1.5 var(--font-mono); }
+.set-card select.field { font: 400 12px/1.5 var(--font-mono); }
+.set-default { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 14px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius-lg); margin-bottom: var(--gap); }
+.set-default .lb { font: 500 11px/1 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.set-default select { font: 400 12px/1.5 var(--font-mono); }
+.set-warn { background: var(--warn-dim); border: 1px solid var(--warn); color: var(--ink); padding: 10px 14px; border-radius: var(--radius-lg); margin-bottom: var(--gap); font: 400 12px/1.5 var(--font-ui); }
+.set-warn.danger { background: var(--fail-dim); border-color: var(--fail); }

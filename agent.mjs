@@ -89,6 +89,7 @@ export class ProviderError extends Error {}
 /* ---------- 主调度 ---------- */
 
 async function chat(messages, opts = {}) {
+  messages = messages.map(m => m.role === 'system' ? { ...m, content: `${m.content}\n\n出力言語：すべての成果物、説明、名称、コメント、テスト名は日本語で記述し、技術用語とコード識別子には English を使用してください。中国語は出力しないでください。指定の JSON だけを返し、思考過程や <think> タグは含めないでください。` } : m);
   const { json = false, maxTokens = 4000, temperature = 0.3 } = opts;
   // 决定 provider：优先用 opts.provider（已 resolve 过的），否则按 project+stageId 解析
   let provider = opts.provider;
@@ -203,7 +204,7 @@ async function callAnthropic(messages, { json, maxTokens, temperature, model, pr
   throw lastErr;
 }
 
-const stripFences = (t) => String(t).trim().replace(/^```[a-z]*\s*/i, '').replace(/```$/, '').trim();
+const stripFences = (t) => String(t).replace(/<think>[\s\S]*?<\/think>/gi, '').trim().replace(/^```[a-z]*\s*/i, '').replace(/```$/, '').trim();
 
 /** 走字符串：取到第 1 个 openChar 开始、与 openChar 同深度的首个 closeChar 闭合的平衡子串。
     不考虑跨字符串边界的括号/外突。失败返 null。 */
@@ -244,7 +245,7 @@ function parseJSON(text, what) {
   }
   // 4) 最后一招：去尾随逗号后硬 parse
   try { return JSON.parse(repairJSON(t)); }
-  catch (e) { throw new ProviderError(`${what}：模型未返回合法 JSON（${e.message}；前 120 字: ${JSON.stringify(String(t).slice(0, 120))}）`); }
+  catch (e) { throw new ProviderError(`${what}: model did not return valid JSON (${e.message})`); }
 }
 
 /* ============================================================
@@ -296,7 +297,7 @@ function defaultFiles(layers, i, profile, name) {
 export const slug = (s) => String(s).normalize('NFC').toLowerCase()
   .replace(/[^\w\u3040-\u30ff\u4e00-\u9fff]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'mod';
 
-/** 上传的输入资料 → 提示词片段（每份截断，总量有上限）。 */
+/** 上传的输入materials → 提示词片段（每份截断，总量有上限）。 */
 export function inputsBrief(project, totalCap = 6000, perCap = 1800) {
   const ins = (project && project.inputs) || [];
   if (!ins.length) return '';
@@ -307,9 +308,9 @@ export function inputsBrief(project, totalCap = 6000, perCap = 1800) {
     const take = Math.min(perCap, left);
     const text = String(f.excerpt || '').slice(0, take);
     left -= text.length;
-    parts.push(`--- 文件：${f.name}（${f.bytes} 字节）---\n${text}${(f.excerpt || '').length > take ? '\n…（截断）' : ''}`);
+    parts.push(`--- ファイル：${f.name}（${f.bytes} 字节）---\n${text}${(f.excerpt || '').length > take ? '\n…（截断）' : ''}`);
   }
-  return `\n项目输入资料（用户上传，共 ${ins.length} 份；以这些内容为准，不要自己臆造）：
+  return `\n项目输入materials（用户上传，共 ${ins.length} 份；以这些内容为准，不要自己臆造）：
 ${parts.join('\n\n')}\n`;
 }
 
@@ -340,36 +341,36 @@ export function skillsBrief(project, stageId = '') {
 /* ---------- 阶段交付物 ---------- */
 
 const ARTIFACT_SPECS = {
-  requirements: [['REQ-01', '需求规格说明书'], ['US-01', '用户故事集'], ['AC-01', '验收标准']],
-  ux: [['UX-01', '信息架构与导航'], ['UX-02', '界面原型说明']],
-  architecture: [['ARC-01', '架构设计说明书'], ['ARC-02', '数据库设计'], ['ARC-03', 'API 规格']],
-  operations: [['SRE-01', '监控与告警方案'], ['SRE-02', '运维手册']],
-  testing: [['TST-01', '测试计划']],
-  deployment: [['DPL-01', '部署方案']],
+  requirements: [['REQ-01', '要件定義書'], ['US-01', 'ユーザーストーリー集'], ['AC-01', '受入基準']],
+  ux: [['UX-01', '情報構造とナビゲーション'], ['UX-02', '画面プロトタイプ仕様']],
+  architecture: [['ARC-01', 'アーキテクチャ設計書'], ['ARC-02', 'データモデル設計'], ['ARC-03', 'API 仕様']],
+  operations: [['SRE-01', '監視・アラート計画'], ['SRE-02', '運用手順書']],
+  testing: [['TST-01', 'テスト計画']],
+  deployment: [['DPL-01', 'デプロイ計画']],
 };
 const LAYOUT_RULE =
-`本文档的附加硬性要求（技术栈与源码目录结构规约）：
-- 必须明确写出最终技术栈：用户指定了技术栈就照抄；用户**没有指定**时，由你选定一套最合适的（运行时 / 框架 / 数据库 / 测试方式）并说明选型理由。
-- 正文必须有一节「源码目录结构」，先用 Markdown 表格列出各层目录（\`src/<层>/\`）的职责，再给一个 json 代码块，格式固定为：
+`本文档的附加硬性要求（技術スタック与源码目录结构规约）：
+- 必须明确写出最终技術スタック：用户指定了技術スタック就照抄；用户**没有指定**时，由你选定一套最合适的（运行时 / 框架 / 数据库 / 测试方式）并説明选型理由。
+- 正文必须有一节「源码目录结构」，先用 Markdown 表格列出各レイヤーディレクトリ（\`src/<层>/\`）的責務，再给一个 json 代码块，格式固定为：
 \`\`\`json
 {"stack":"Next.js + NestJS + PostgreSQL","layers":[{"dir":"core","responsibility":"…"},{"dir":"domain","responsibility":"…"}]}
 \`\`\`
-- 层名只用小写字母/数字/连字符，3–6 层；后续每个开发模块的源码都会按这个清单归档到 \`src/<层>/（直接放在层目录里，**不许再建模块子目录、文件名也不带 WBS 序号**；用业务语义命名，如 OrderService.java、order-service.mjs、order_service.py）\`，层要与模块划分对得上。
-- 技术栈要与实际能落地的代码一致（本项目代码是零第三方依赖的 Node ESM，技术栈里可以写目标架构，但目录规约必须是可执行的）。`;
+- 层名只用小写字母/数字/连字符，3–6 层；后续每个开发模块的源码都会按这个清单归档到 \`src/<层>/（直接放在レイヤーディレクトリ里，**不许再建模块子目录、文件名也不带 WBS 序号**；用业务语义命名，如 OrderService.java、order-service.mjs、order_service.py）\`，层要与模块划分对得上。
+- 技術スタック要与实际能落地的代码一致（本项目代码是サードパーティ依存なし的 Node ESM，技術スタック里可以写目標架构，但目录规约必须是可执行的）。`;
 
 async function oneArtifact(project, stage, spec, feedback, allNames, extra = '') {
   const [id, name] = spec;
   const sys = `你是软件交付流水线里的${stage.agent}，负责「${stage.name}」阶段，正在写其中一份交付物。`;
   const user =
 `项目名称：${project.name}
-项目概要：${project.brief || '（未提供）'}
-技术栈：${project.tech || '（未指定）'}
+项目概要：${project.brief || '（未指定）'}
+技術スタック：${project.tech || '（未指定）'}
 ${inputsBrief(project)}${skillsBrief(project, stage.id)}${feedback ? `上一轮被驳回的意见（必须吸收）：〔${feedback.category}〕${feedback.comment}\n` : ''}
 请写出这一份交付物：**${id} ${name}**
 （本阶段共 ${allNames.length} 份：${allNames.join('、')}；本份与其他份不重复）
 
 ${extra}要求：
-1. 针对上面这个具体项目，Markdown 正文，中文，不要空话模板。
+1. 上記プロジェクトに即した Markdown 本文を日本語で作成してください。技術用語・コード識別子には English を使用できます。中国語は使用せず、汎用的な定型文だけで済ませないでください。
 2. 篇幅 800–1500 字；表格用 Markdown 表格。
 3. 只输出 JSON：{"content":"# ${name}\\n\\n..."}`;
   const { text, usage, model } = await chat(
@@ -382,7 +383,7 @@ ${extra}要求：
   return { artifact: { id, name, type: 'markdown', content: parsed || `# ${name}\n\n（模型未返回内容）`, status: 'generated' }, usage, model };
 }
 
-export const artifactSpec = (stageId) => ARTIFACT_SPECS[stageId] || [['DOC-01', '阶段产物']];
+export const artifactSpec = (stageId) => ARTIFACT_SPECS[stageId] || [['DOC-01', 'ステージ成果物']];
 
 export async function stageArtifacts(project, stage, feedback, onProgress) {
   const specs = artifactSpec(stage.id);
@@ -405,19 +406,19 @@ export async function wbs(project) {
   const layers = (project.arch && project.arch.layers && project.arch.layers.length) ? project.arch.layers : DEFAULT_LAYERS;
   const stack = (project.arch && project.arch.stack) || project.tech || '（未指定）';
   const profile = profileOf(stack);
-  const sys = '你是任务规划师，负责把软件需求拆成可独立开发、可单元测试的模块。你只输出 JSON。';
+  const sys = '你是任务规划师，负责把软件需求拆成可独立开发、可単体テスト的模块。你只输出 JSON。';
   const user =
 `项目：${project.name}
-概要：${project.brief || '（未提供）'}
-技术栈：${stack}
-${inputsBrief(project)}${skillsBrief(project, 'wbs')}架构已定的源码层目录（一个 Epic 一个模块，源码就落在它所属的层目录下）：${layers.join(' / ')}
+概要：${project.brief || '（未指定）'}
+技術スタック：${stack}
+${inputsBrief(project)}${skillsBrief(project, 'wbs')}架构已定的源码レイヤーディレクトリ（一个 Epic 一个模块，源码就落在它所属的レイヤーディレクトリ下）：${layers.join(' / ')}
 
-把项目拆成 4–7 个 Epic，每个 Epic 2–4 个 Task。每个 Epic 之后会作为一个开发模块，由工程师写代码 + 单元测试。
+把项目拆成 4–7 个 Epic，每个 Epic 2–4 个 Task。每个 Epic 之后会作为一个开发模块，由工程师写代码 + 単体テスト。
 要求：
-1. 每个 Epic 必须带 layer，值只能取上面列出的层之一（决定源码落到哪一层目录）。
+1. 每个 Epic 必须带 layer，值只能取上面列出的层之一（决定源码落到哪一レイヤーディレクトリ）。
 2. Task 要小到能用一个模块实现并写单测；files 写成 ${defaultFiles(layers, 0, profile, '基础框架')}。
 3. 只输出 JSON：
-{"epics":[{"name":"基础框架","layer":"${layers[0]}","goal":"一句话目标","tasks":[{"name":"任务名","files":"${defaultFiles(layers, 0, profile, '基础框架')}","acceptance":"可机器判定的验收标准"}]}]}`;
+{"epics":[{"name":"基础框架","layer":"${layers[0]}","goal":"一句话目標","tasks":[{"name":"任务名","files":"${defaultFiles(layers, 0, profile, '基础框架')}","acceptance":"可机器判定的受入基準"}]}]}`;
   const { text, usage, model } = await chat(
     [{ role: 'system', content: sys }, { role: 'user', content: user }],
     { json: true, maxTokens: 4000, project, stageId: 'wbs' },
@@ -432,11 +433,11 @@ ${inputsBrief(project)}${skillsBrief(project, 'wbs')}架构已定的源码层目
       id: `E${i + 1}-T${j + 1}`,
       name: String(t.name || `Task ${j + 1}`).slice(0, 80),
       files: String(t.files || defaultFiles(layers, i, profile, e.name)).slice(0, 120),
-      acceptance: String(t.acceptance || '单元测试通过').slice(0, 200),
+      acceptance: String(t.acceptance || '単体テスト通过').slice(0, 200),
       status: 'todo',
     })),
   })).filter(e => e.tasks.length);
-  if (!epics.length) throw new ProviderError('WBS：模型没有给出可用的 Epic');
+  if (!epics.length) throw new ProviderError('WBS: model returned no usable epics');
   return { epics, task_count: epics.reduce((a, e) => a + e.tasks.length, 0), layers, generated_at: new Date().toISOString(), usage, model };
 }
 
@@ -446,11 +447,11 @@ function langSpec(profile, dir, testPath) {
   const testClass = testPath.split('/').pop().replace(/\.[a-z]+$/, '');
   if (profile.id === 'java' || profile.id === 'cap-java') return {
     role: '你是资深 Java 工程师，产出能被 javac 编译、被 java 真跑通的 Java 代码。你只输出 JSON。',
-    rules: `1. 只用 JDK 标准库（java.util / java.math / java.time / java.util.stream 等）；**禁止任何第三方依赖，也禁止 Spring / JPA / SAP CAP 注解**——执行侧只有 javac，没有 Maven 仓库，import 不到的包会直接编译失败。需要存储/状态就用内存集合模拟。
+    rules: `1. 只用 JDK 標準ライブラリ（java.util / java.math / java.time / java.util.stream 等）；**禁止任何第三方依赖，也禁止 Spring / JPA / SAP CAP 注解**——执行侧只有 javac，没有 Maven 仓库，import 不到的包会直接编译失败。需要存储/状态就用内存集合模拟。
 2. 不要写 package 声明（编译走默认包）；类名用**业务语义**的 PascalCase 英文（例：OrderRule / OrderService），文件名 = public 类名；**整个工作区里类名必须全局唯一**——没有 package，各层的 .java 一起进同一个 classpath，两个层各写一个 Order 或 ApiResponse 就是 「クラスOrderが重複しています」、整个项目全红：同一个业务实体的实体类**只在一个层定义**，别的层复用它或换更具体的名字（写 OrderRepositoryItem 而不是再写一个 Order）；**类名里不要带 WBS 模块号/任务号**（不写 M1OrderRule、E2T1OrderRule）。
 3. 不要 System.currentTimeMillis / new Random()（时间、随机等外部输入请作为参数传入）。`,
-    files: `源码只能放 ${dir}/ 下的 .java（架构规约指定的层目录，不许改到别处）`,
-    test: `单元测试放 ${testPath}，public 类名 = 被测模块名 + Test（如 ${testClass}），且必须是可直接执行的 main（执行侧就是 \`java ${testClass}\`）：
+    files: `源码只能放 ${dir}/ 下的 .java（架构规约指定的レイヤーディレクトリ，不许改到别处）`,
+    test: `単体テスト放 ${testPath}，public 类名 = 被测模块名 + Test（如 ${testClass}），且必须是可直接执行的 main（执行侧就是 \`java ${testClass}\`）：
 public class ${testClass} {
   static int pass = 0, fail = 0;
   static void check(String name, boolean ok) { if (ok) pass++; else { fail++; System.out.println("not ok - " + name); } }
@@ -464,12 +465,12 @@ public class ${testClass} {
 }`,
   };
   if (profile.id === 'python') return {
-    role: '你是资深 Python 工程师，产出能被 python3 + 标准库 unittest 真跑通的代码。你只输出 JSON。',
-    rules: `1. 只用 Python 标准库；**禁止第三方包**（fastapi/flask/pydantic/requests/pytest 一律不要——它们没安装，import 就 ModuleNotFoundError）。需要存储/状态就用内存结构模拟。
+    role: '你是资深 Python 工程师，产出能被 python3 + 標準ライブラリ unittest 真跑通的代码。你只输出 JSON。',
+    rules: `1. 只用 Python 標準ライブラリ；**禁止第三方包**（fastapi/flask/pydantic/requests/pytest 一律不要——它们没安装，import 就 ModuleNotFoundError）。需要存储/状态就用内存结构模拟。
 2. 模块文件名用 ASCII snake_case 的业务语义名（例：order_service.py），不要带模块号，不要有 import 时的副作用。
 3. 不要 time.time() / random（时间、随机等外部输入请作为参数传入）。`,
-    files: `源码只能放 ${dir}/ 下的 .py（架构规约指定的层目录，不许改到别处）；**不许建模块子目录**，文件名用业务语义的 snake_case（如 order_service.py），**不要带 WBS 模块号/任务号**（不写 m1_order_service.py），同层靠业务名区分`,
-    test: `单元测试放 ${testPath}：标准库 unittest，头部把源码目录加进 sys.path 再按文件名 import，文件尾部必须有 unittest.main()：
+    files: `源码只能放 ${dir}/ 下的 .py（架构规约指定的レイヤーディレクトリ，不许改到别处）；**不许建模块子目录**，文件名用业务语义的 snake_case（如 order_service.py），**不要带 WBS 模块号/任务号**（不写 m1_order_service.py），同层靠business-name区分`,
+    test: `単体テスト放 ${testPath}：標準ライブラリ unittest，头部把源码目录加进 sys.path 再按文件名 import，文件尾部必须有 unittest.main()：
 import os, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '${dir}'))
 from <你的模块文件名去 .py> import <被测函数>
@@ -484,8 +485,8 @@ if __name__ == '__main__':
     role: '你是资深 Node.js 工程师，产出可运行、可测试的 ES Module 代码。你只输出 JSON。',
     rules: `1. 只允许 Node 内置模块与纯函数；**禁止引入任何第三方包**（pg / express / axios / dotenv / uuid 等一律不要——它们没安装，import 会直接报 ERR_MODULE_NOT_FOUND）。需要存储/状态就用内存对象或纯数据结构模拟。
 2. 不要网络、不要文件系统、不要 Date.now/Math.random（时间请由参数传入）。`,
-    files: `源码只能放 ${dir}/ 下的 .mjs（架构规约指定的层目录，不许改到别处）；**不许建模块子目录**，文件名用业务语义的 kebab-case（如 order-service.mjs），**不要带 WBS 模块号/任务号**（不写 m1-order-service.mjs、M1OrderService.mjs），同层靠业务名区分`,
-    test: `单元测试放 ${testPath}，必须用：
+    files: `源码只能放 ${dir}/ 下的 .mjs（架构规约指定的レイヤーディレクトリ，不许改到别处）；**不许建模块子目录**，文件名用业务语义的 kebab-case（如 order-service.mjs），**不要带 WBS 模块号/任务号**（不写 m1-order-service.mjs、M1OrderService.mjs），同层靠business-name区分`,
+    test: `単体テスト放 ${testPath}，必须用：
 import { test } from 'node:test'; import assert from 'node:assert/strict';
 并从 '${'../'.repeat(testPath.split('/').length - 1)}${dir}/xxx.mjs' 导入被测函数（测试目录比源码浅一层，相对路径以 ${'../'.repeat(testPath.split('/').length - 1)} 开头）。`,
   };
@@ -498,23 +499,23 @@ export async function moduleCode(project, mod, feedback) {
   const testPath = mod.test_path_planned || testPathOf(profile, mod.layer || 'core', 0, mod.name);
   const tasks = (project.wbs.epics.find(e => e.id === mod.epic)?.tasks) || [];
   const spec = langSpec(profile, dir, testPath);
-  const cds = profile.cds ? `\n8. 本项目是 SAP CAP：本模块若涉及数据模型或服务定义，必须同时产出真实 CDS 文件（db/schema.cds、srv/<名>-service.cds）：namespace + entity（**每个实体必须有 key**）+ service/projection；不要用 Java 注解或任何 ORM 替代 CDS 建模。` : '';
+  const cds = profile.cds ? `\n8. 本项目是 SAP CAP：本模块若涉及Data models或服务定义，必须同时产出真实 CDS 文件（db/schema.cds、srv/<名>-service.cds）：namespace + entity（**每个实体必须有 key**）+ service/projection；不要用 Java 注解或任何 ORM 替代 CDS 建模。` : '';
   const exFile = profile.ext;
   const sys = spec.role;
   const user =
-`项目：${project.name}（技术栈：${stack} → 语言档案：${profile.label}）
+`项目：${project.name}（技術スタック：${stack} → 言語プロファイル：${profile.label}）
 模块：${mod.name}
 模块所属源码层：${mod.layer || 'core'}（架构规约；源码直接放在 ${dir}/ 这一层，**不要再建模块子目录**）
-模块目标：${mod.goal || '（未给出）'}
+模块目標：${mod.goal || '（未给出）'}
 任务清单：
 ${tasks.map(t => `- ${t.name}${t.acceptance ? `（验收：${t.acceptance}）` : ''}`).join('\n') || '- （无）'}
 ${feedback ? `\n上一轮被驳回的意见（必须修正）：〔${feedback.category}〕${feedback.comment}\n` : ''}${skillsBrief(project, 'development')}
 硬性要求：
 ${spec.rules}
-4. ${spec.files}；单元测试放 ${testPath}。
+4. ${spec.files}；単体テスト放 ${testPath}。
 5. ${spec.test}
-6. 每个文件 ≤ 150 行；被测函数要导出（Java 用 public static）。
-7. 单元测试要确实覆盖任务清单里的行为，断言要具体（断言值，不要只 check("ok", true) / assert.ok(x)）。${cds}
+6. 每files ≤ 150 行；被测函数要导出（Java 用 public static）。
+7. 単体テスト要确实覆盖任务清单里的行为，断言要具体（断言值，不要只 check("ok", true) / assert.ok(x)）。${cds}
 9. 只输出 JSON：
 {"summary":"本模块实现了什么","files":[{"path":"${dir}/<业务文件名>${exFile}","content":"..."}],"test":{"path":"${testPath}","content":"..."}}`;
   const budget = profile.id === 'java' || profile.id === 'cap-java' ? 24000 : 8000;
@@ -526,14 +527,14 @@ ${spec.rules}
       { json: true, maxTokens: budget, temperature: attempt === 1 ? 0.2 : 0.1, project, stageId: 'development' },
     );
     text = r.text; usage = r.usage; model = r.model;
-    try { out = parseJSON(text, `模块 ${mod.id} 代码`); } catch (e) { out = null; if (attempt === 2) throw e; continue; }
+    try { out = parseJSON(text, `Module ${mod.id} code`); } catch (e) { out = null; if (attempt === 2) throw e; continue; }
     if ((out.files || []).length && out.test && typeof out.test.content === 'string') break;
     if (attempt === 2) break;
   }
   const files = Array.isArray(out && out.files) ? out.files : [];
   const test = out && out.test && typeof out.test.content === 'string' ? out.test : null;
-  const shape = `（返回字段：${Object.keys(out || {}).join('、') || '空'}；files=${files.length} 个${test ? '' : '，test 缺失或不是 {path,content}'}；${text.length} 字符）`;
-  if (!files.length) throw new ProviderError(`模块 ${mod.id}：模型没有返回源码文件${shape}`);
-  if (!test) throw new ProviderError(`模块 ${mod.id}：模型没有返回单元测试${shape}`);
+  const shape = ` (fields: ${Object.keys(out || {}).join(', ') || 'none'}; files=${files.length}${test ? '' : '; test is missing or is not {path,content}'}; ${text.length} characters)`;
+  if (!files.length) throw new ProviderError(`Module ${mod.id}: model returned no source files${shape}`);
+  if (!test) throw new ProviderError(`Module ${mod.id}: model returned no unit test${shape}`);
   return { summary: String(out.summary || '').slice(0, 300), files, test, usage, model, profile: profile.id };
 }

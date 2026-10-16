@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark" data-density="comfortable">
+<html lang="ja" data-theme="dark" data-density="comfortable">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Dev Platform · 软件开发可视化平台</title>
+<title>AI Dev Platform · Software Delivery Visual Platform</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -15,22 +15,23 @@
   <aside class="rail">
     <div class="rail-brand">
       <div class="mark"><i></i><span class="lb">AI Dev Platform</span></div>
-      <div class="sub" data-i18n="app.tagline">brief → 阶段门禁 → 可运行</div>
+      <div class="sub" data-i18n="app.tagline">brief → stage gates → running code</div>
     </div>
 
     <nav class="rail-nav" id="nav">
-      <div class="rail-sec"><span data-i18n="rail.entry">入口</span></div>
-      <button class="navbtn" data-view="projects"><span class="ic">00</span><span class="lb" data-i18n="nav.projects">项目</span><span class="badge" id="navProjects">0</span></button>
-      <div class="rail-sec"><span data-i18n="rail.views">项目视图</span></div>
-      <button class="navbtn" data-view="overview"><span class="ic">01</span><span class="lb" data-i18n="nav.overview">总览</span><span class="badge" data-i18n="rail.monitor">Monitor</span></button>
-      <button class="navbtn" data-view="flow"><span class="ic">02</span><span class="lb" data-i18n="nav.flow">流程与门禁</span><span class="badge" id="navStages">8</span></button>
-      <button class="navbtn" data-view="wbs"><span class="ic">03</span><span class="lb" data-i18n="nav.wbs">WBS / 开发</span><span class="badge" id="navTasks">0</span></button>
-      <div class="rail-sec"><span data-i18n="rail.deliverables">交付物</span></div>
-      <button class="navbtn" data-view="artifacts"><span class="ic">04</span><span class="lb" data-i18n="nav.artifacts">产物</span><span class="badge" id="navArtifacts">0</span></button>
-      <button class="navbtn" data-view="code"><span class="ic">05</span><span class="lb" data-i18n="nav.code">源码</span><span class="badge" id="navCode">0</span></button>
-      <button class="navbtn" data-view="runs"><span class="ic">06</span><span class="lb" data-i18n="nav.runs">执行记录</span><span class="badge" data-i18n="rail.live">live</span></button>
-      <div class="rail-sec"><span data-i18n="rail.rules">工程约定</span></div>
-      <button class="navbtn" data-view="skills"><span class="ic">07</span><span class="lb" data-i18n="nav.skills">技能</span><span class="badge" id="navSkills">0</span></button>
+      <div class="rail-sec"><span data-i18n="rail.entry">Entry</span></div>
+      <button class="navbtn" data-view="projects"><span class="ic">00</span><span class="lb" data-i18n="nav.projects">Projects</span><span class="badge" id="navProjects">0</span></button>
+      <div class="rail-sec"><span data-i18n="rail.views">Project views</span></div>
+      <button class="navbtn" data-view="overview"><span class="ic">01</span><span class="lb" data-i18n="nav.overview">Overview</span><span class="badge" data-i18n="rail.monitor">Monitor</span></button>
+      <button class="navbtn" data-view="flow"><span class="ic">02</span><span class="lb" data-i18n="nav.flow">Pipeline &amp; Gates</span><span class="badge" id="navStages">8</span></button>
+      <button class="navbtn" data-view="wbs"><span class="ic">03</span><span class="lb" data-i18n="nav.wbs">WBS / Development</span><span class="badge" id="navTasks">0</span></button>
+      <div class="rail-sec"><span data-i18n="rail.deliverables">Deliverables</span></div>
+      <button class="navbtn" data-view="artifacts"><span class="ic">04</span><span class="lb" data-i18n="nav.artifacts">Artifacts</span><span class="badge" id="navArtifacts">0</span></button>
+      <button class="navbtn" data-view="code"><span class="ic">05</span><span class="lb" data-i18n="nav.code">Source</span><span class="badge" id="navCode">0</span></button>
+      <button class="navbtn" data-view="runs"><span class="ic">06</span><span class="lb" data-i18n="nav.runs">Run Log</span><span class="badge" data-i18n="rail.live">live</span></button>
+      <div class="rail-sec"><span data-i18n="rail.rules">Conventions</span></div>
+      <button class="navbtn" data-view="skills"><span class="ic">07</span><span class="lb" data-i18n="nav.skills">Skills</span><span class="badge" id="navSkills">0</span></button>
+      <button class="navbtn" data-view="settings"><span class="ic">08</span><span class="lb" data-i18n="nav.settings">LLM Providers</span><span class="badge" id="navSettings">—</span></button>
     </nav>
 
     <div class="rail-foot">
@@ -44,15 +45,15 @@
       <div class="crumb">
         <span class="proj" id="crumbProj">—</span>
         <span class="sep">/</span>
-        <span class="view" id="crumbView">项目</span>
+        <span class="view" id="crumbView">Projects</span>
       </div>
-      <div class="cmdk" id="livebar"><span class="mono muted">⌁</span><span id="liveText" data-i18n="top.connecting">实时连接中…</span></div>
+      <div class="cmdk" id="livebar"><div id="liveProgress"></div><span id="liveText" data-i18n="top.connecting">Connecting…</span></div>
       <div class="top-actions">
         <span class="chip" id="chipChan">—</span>
         <span class="chip" id="chipMode">—</span>
         <select class="btn" id="tgLang" title="Language"></select>
-        <button class="btn" id="tgTheme">暗色</button>
-        <button class="btn" id="tgDensity">宽松</button>
+        <button class="btn" id="tgTheme">Dark</button>
+        <button class="btn" id="tgDensity">Compact</button>
       </div>
     </header>
 

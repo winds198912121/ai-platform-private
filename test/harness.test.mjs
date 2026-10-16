@@ -254,6 +254,21 @@ test('创建项目后，第一个阶段自动执行并停在「等待审核」',
   assert.equal(stage(p, 'ux').status, 'pending', '后续阶段不得自动执行');
 });
 
+test('阶段进度随真实节点推送，执行完成显示 100% 并保留人工审批门禁', async () => {
+  const p = mk('human_gate', '阶段进度');
+  const observed = [];
+  const unsubscribe = H.subscribe(ev => {
+    if (ev.type === 'state' && ev.projectId === p.id) observed.push(stage(p, 'requirements').progress);
+  });
+  try {
+    await waitFor(() => stage(p, 'requirements').status === 'awaiting_review');
+    for (const milestone of [20, 35, 90, 100]) assert.ok(observed.includes(milestone), `SSE 应推送 ${milestone}%`);
+    assert.ok(observed.every((v, i) => !i || v >= observed[i - 1]), '同一轮执行的进度不倒退');
+    assert.equal(stage(p, 'requirements').progress_label, 'awaiting review');
+    assert.equal(stage(p, 'ux').status, 'pending', '执行进度 100% 不代表人工已批准');
+  } finally { unsubscribe(); }
+});
+
 test('门禁：未批准阶段不可批准（状态不对）', async () => {
   const p = mk('human_gate', '门禁-状态');
   await waitFor(() => stage(p, 'ux').status === 'awaiting_review' || stage(p, 'requirements').status === 'awaiting_review');

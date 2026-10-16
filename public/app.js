@@ -2,6 +2,7 @@
    app.js — 单页应用：视图 / 门禁操作 / SSE 实时刷新
    ============================================================ */
 import { treeRows, sourceFiles } from './tree.mjs';
+import { progressOf, stageExecution } from './progress.mjs';
 import { t, setLang, applyStatic, LANGS, lang, audit, has } from './i18n.mjs';
 
 let DB = { projects: [], active: null };
@@ -28,12 +29,49 @@ const STS = { pending: { get t() { return t('st.pending'); }, c: 'bare' }, runni
 const MSTS = { pending: { get t() { return t('st.awaiting_dev'); }, c: 'bare' }, running: { get t() { return t('st.developing'); }, c: 'run' }, awaiting_review: { get t() { return t('st.awaiting_appr'); }, c: 'warn' }, approved: { get t() { return t('st.approved'); }, c: 'ok' }, rejected: { get t() { return t('st.rejected'); }, c: 'fail' }, failed: { get t() { return t('st.failed'); }, c: 'fail' } };
 const FLOWSTATE = { approved: 'delivered', running: 'running', awaiting_review: 'review', rejected: 'rejected', failed: 'rejected', pending: 'pending' };
 // 分类值保持稳定（会发给服务端并存库），只有显示文案跟着语言走
-const REJECT_CATS = [['需求缺失', 'cat.requirement'], ['架构不当', 'cat.arch'], ['UX 问题', 'cat.ux'], ['技术问题', 'cat.tech'], ['安全/合规', 'cat.security'], ['业务不符', 'cat.business']];
+const REJECT_CATS = [['requirement', 'cat.requirement'], ['architecture', 'cat.arch'], ['ux', 'cat.ux'], ['technical', 'cat.tech'], ['security', 'cat.security'], ['business', 'cat.business']];
 // 各阶段可选的调用模型；选「缺省」= 不定义，服务端用 deepseek（AI_PLATFORM_MODEL 可改）。要别的模型直接调 POST /api/projects/:id/models
-const MODEL_OPTS = ['deepseek-v4-flash', 'deepseek-reasoner'];
+const MODEL_OPTS = ['deepseek-v4-flash', 'deepseek-reasoner'];          // 兜底：settings 还没拉到时显示这两个老默认
+let ENABLED_MODELS = [];                              // [{providerId, providerName, model}] —— 来自 /api/settings/enabled-models
+let SETTINGS_CACHE = null;                            // 全量 provider 列表（settings 视图渲染用）
+const SETTINGS_DRAFT = {};                            // providerId → 表单草稿（SSE 重渲染时不被服务端返回覆盖）
+/** 写入 p.models[stageId] 和下拉框 value 都用这个 "providerId/modelName" 形式。 */
+const modelKey = (m) => `${m.providerId}/${m.model}`;
+/** 取一个 provider 的本地"输入态"——草稿、SSE 重渲染都不丢。 */
+const settingsDraft = (id) => (SETTINGS_DRAFT[id] = SETTINGS_DRAFT[id] || {});
 
 const P = () => DB.projects.find(p => p.id === S.project) || null;
 const pill = (status, map) => { const s = (map || STS)[status] || { t: status, c: 'bare' }; return `<span class="pill ${s.c}">${s.t}</span>`; };
+
+const PROGRESS_PHASES = {
+  started: 'starting', preparing: 'preparing', planned: 'planned',
+  'generating code': 'code', 'files written': 'written', 'running tests': 'tests',
+  'generating artifacts': 'artifacts', 'generating WBS': 'wbs', verifying: 'verifying',
+};
+function executionBar(item, label, compact = false) {
+  const percent = progressOf(item);
+  let phase = item.progress_label === 'modules'
+    ? t('progress.modules', { done: item.completed, total: item.total })
+    : t(`progress.${PROGRESS_PHASES[item.progress_label] || 'starting'}`);
+  if (item.status === 'pending' || item.status === 'rejected') phase = t('st.pending');
+  else if (item.status === 'approved') phase = t('st.approved');
+  else if (item.status === 'awaiting_review') phase = t('progress.review');
+  else if (item.status === 'failed') phase = item.progress_label && item.progress_label !== 'failed'
+    ? t('progress.stopped', { step: phase }) : t('st.failed');
+  else if (item.status === 'running' && DB.channel?.channel === 'live' && ['generating code', 'generating artifacts', 'generating WBS'].includes(item.progress_label)) phase += ` · ${t('progress.waiting')}`;
+  return `<div class="execution-progress${compact ? ' compact' : ''}" data-status="${esc(item.status)}" title="${esc(label)} · ${esc(phase)}">
+    <div class="progress-heading"><span>${esc(label)}</span><strong>${percent}%</strong></div>
+    <div class="execution-track" role="progressbar" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-valuetext="${percent}% · ${esc(phase)}"><i style="width:${percent}%"></i></div>
+    ${compact ? '' : `<div class="progress-phase">${esc(phase)}</div>`}
+  </div>`;
+}
+
+function renderLiveProgress() {
+  const p = P();
+  const stage = p && (p.stages.find(s => s.status === 'running') || summary(p).cur || p.stages.at(-1));
+  document.getElementById('liveProgress').innerHTML = stage
+    ? executionBar(stageExecution(p, stage), stageLabel(stage)) : '';
+}
 
 /** 产物编号里的数字（REQ-01 → 1；WBS 这种没编号的 → -1，排在本阶段最前）。 */
 const artNum = (id) => { const m = String(id || '').match(/\d+/); return m ? Number(m[0]) : -1; };
@@ -70,7 +108,7 @@ function allArtifacts(p) {
   const out = [];
   p.stages.forEach(s => (s.artifacts || []).forEach(a => out.push({ ...a, stage: s.id, stageName: s.name })));
   p.modules.forEach(m => (m.artifacts || []).forEach(a => out.push({ ...a, stage: 'development', stageName: m.name, module: m.id })));
-  if (p.wbs.epics.length) out.push({ id: 'WBS', name: 'WBS 任务分解', type: 'wbs', stage: 'wbs', stageName: 'WBS 分解', status: 'generated' });
+  if (p.wbs.epics.length) out.push({ id: 'WBS', name: 'WBS Breakdown', type: 'wbs', stage: 'wbs', stageName: 'WBS 分解', status: 'generated' });
   // 按「阶段顺序 → 编号数字」排（sort 稳定，同阶段同编号保持生成顺序：REQ → US → AC）；模块产物也回到开发阶段的位置上
   const order = new Map((p.stages || []).map((s, i) => [s.id, i]));
   return out.sort((a, b) =>
@@ -159,7 +197,7 @@ function codeGrid(pane, { leftTitle = null, leftKicker = '', meta = '', wideLeft
 
 const VIEWS = {
 
-  projects: { name: '项目入口', render() {
+  projects: { name: 'Projects', render() {
     const npType = NPTYPE || (DB.types || [])[0]?.id || '';
     const npWf = NPWF || typeMeta(npType).workflow || '';
     const editCard = PEDIT ? `                    <!-- 编辑项目：占右侧那一栏，字段与「新建项目」一致；分类/工作流只在没批准过阶段时可改 -->
@@ -285,7 +323,7 @@ const VIEWS = {
       </div>`;
   }},
 
-  overview: { name: '总览', render() {
+  overview: { name: 'Overview', render() {
     const p = P(); if (!p) return noProject();
     const s = summary(p);
     const recent = p.events.slice(-60).reverse();     // 卡片有滚动条，给够条目让活动流真正填满高度
@@ -316,7 +354,7 @@ const VIEWS = {
       </div>`;
   }},
 
-  flow: { name: '流程与门禁', render() {
+  flow: { name: 'Pipeline & Gates', render() {
     const p = P(); if (!p) return noProject();
     const sel = p.stages.find(s => s.id === S.stage) || p.stages.find(s => s.status !== 'approved') || p.stages[0];
     S.stage = sel.id;
@@ -340,6 +378,7 @@ const VIEWS = {
         <div class="card">
           <header><h2>${esc(stageLabelN(p, sel))}</h2><span class="kicker">${esc(sel.agent)}</span><span class="right">${pill(sel.status)}</span></header>
           <div class="body insp">
+            ${executionBar(stageExecution(p, sel), t('progress.execution'))}
             <div class="kv">
               <div class="k">${esc(t('stage.detail'))}</div><div class="v mono">${esc(sel.id)}</div>
               <div class="k">${esc(t('art.meta.type'))}</div><div class="v">${esc(sel.kind === 'development' ? t('art.kind.dev') : sel.kind === 'wbs' ? t('art.kind.wbs') : t('art.kind.doc'))}</div>
@@ -361,7 +400,7 @@ const VIEWS = {
       ${sel.kind === 'development' ? devSection(p) : ''}`;
   }},
 
-  skills: { name: '技能库', render() {
+  skills: { name: 'Skills', render() {
     const p = P(); if (!p) return noProject();
     const list = [...(p.skills || [])].sort((a, b) =>        // 按流程序号排：所有阶段（空）= 最前，其余按阶段顺序 → 编号
       skillStageOrder(p, a.stage) - skillStageOrder(p, b.stage) || artNum(a.id) - artNum(b.id));
@@ -437,7 +476,7 @@ const VIEWS = {
       </div>`;
   }},
 
-  wbs: { name: 'WBS / 开发', render() {
+  wbs: { name: 'WBS / Development', render() {
     const p = P(); if (!p) return noProject();
     if (!p.wbs.epics.length) return `<div class="page-head"><div>${viewTitle('wbs', esc(t('view.wbs')))}</div></div><div class="card"><div class="empty"><h2>${esc(t('wbs.notReady'))}</h2><div class="tiny">${esc(t('wbs.notReady.desc'))}</div></div></div>`;
     const tab = S.wbsTab;
@@ -448,7 +487,7 @@ const VIEWS = {
       const open = S.epicOpen[e.id] ?? (st === 'running');          // 正在执行的自动打开（用户手动折叠过就听用户的）
       const live = st === 'running';
       return `
-      <div class="tnode epic s-${st}" data-epic="${e.id}" data-status="${st}"><span class="tw">${open ? '▾' : '▸'}</span><span class="tid">${e.id}</span><span class="tn">${esc(e.name)}</span><span class="stcell">${live ? '<span class="pulse" data-live="1" title="正在执行"></span>' : ''}${mod ? pill(st, MSTS) : `<span class="pill bare">${esc(t('wbs.noModule'))}</span>`}<span class="mono tiny muted">${esc(t('wbs.tasks', { n: e.tasks.length }))}</span></span></div>
+      <div class="tnode epic s-${st}" data-epic="${e.id}" data-status="${st}"><span class="tw">${open ? '▾' : '▸'}</span><span class="tid">${e.id}</span><span class="tn">${esc(e.name)}</span><span class="stcell">${mod ? executionBar(mod, e.name, true) + pill(st, MSTS) : `<span class="pill bare">${esc(t('wbs.noModule'))}</span>`}<span class="mono tiny muted">${esc(t('wbs.tasks', { n: e.tasks.length }))}</span></span></div>
       ${open ? e.tasks.map(tk => `<div class="tnode child s-${st}" data-task="${tk.id}" data-status="${st}"><span class="tw"></span><span class="tid">${tk.id}</span><span class="tn">${esc(tk.name)}</span><span class="stcell"><span class="dot s-${st}${live ? ' live' : ''}"></span><span class="mono tiny muted">${esc(tk.files)}</span></span></div>`).join('') : ''}
       ${open ? `<div class="tnode child"><span class="tw"></span><span class="tid"></span><span class="tn muted">${esc(t('wbs.goal'))}：${esc(e.goal)}</span><span class="stcell"></span></div>` : ''}`;
     }).join('');
@@ -463,7 +502,7 @@ const VIEWS = {
     `;
   }},
 
-  code: { name: '源码', render() {
+  code: { name: 'Source', render() {
     const p = P(); if (!p) return noProject();
     const all = WS.projectId === p.id ? WS.files : [];
     const src = sourceFiles(all);
@@ -495,7 +534,7 @@ const VIEWS = {
       ${codeGrid(pane, { leftTitle: t('code.listTitle'), leftKicker: t('code.leftKicker', { n: src.length }), meta })}`;
   }},
 
-  artifacts: { name: '产物', render() {
+  artifacts: { name: 'Artifacts', render() {
     const p = P(); if (!p) return noProject();
     const tab = S.artTab || 'artifacts';
     const arts = allArtifacts(p);
@@ -554,7 +593,7 @@ const VIEWS = {
       })}`;
   }},
 
-  runs: { name: '执行记录', render() {
+  runs: { name: 'Run Log', render() {
     const p = P(); if (!p) return noProject();
     const evs = p.events.slice().reverse();
     return `
@@ -566,16 +605,156 @@ const VIEWS = {
         </div></div>
       </div>`;
   }},
+
+  settings: { name: 'LLM Providers', render() {
+    if (!SETTINGS_CACHE) return `<div class="page-head"><div>${viewTitle('settings', esc(t('view.settings')))}</div></div><div class="card"><div class="empty"><h2>${esc(t('msg.loading'))}</h2></div></div>`;
+    const list = SETTINGS_CACHE.providers || [];
+    const defId = SETTINGS_CACHE.defaultProvider || '';
+    const enabled = list.filter(x => x.enabled && x.hasKey).length;
+    const warn = enabled === 0
+      ? `<div class="set-warn danger">${esc(t('set.warn.noProvider'))}</div>`
+      : '';
+    const defaultBox = `
+      <div class="set-default">
+        <span class="lb">${esc(t('set.default'))}</span>
+        <select class="field" id="setDefaultSel" style="max-width:280px">
+          <option value="">—</option>
+          ${list.map(x => `<option value="${esc(x.id)}"${x.id === defId ? ' selected' : ''}>${esc(x.name)}${x.enabled && x.hasKey ? '' : ' (' + esc(t(x.enabled ? 'set.noKey' : 'set.disabled')) + ')'}</option>`).join('')}
+        </select>
+        <span class="hint">${esc(t('set.default.hint'))}</span>
+        <button class="btn primary" data-set-default style="margin-left:auto">${esc(t('set.default.set'))}</button>
+      </div>`;
+    const cards = list.map(p => providerCard(p)).join('');
+    return `
+      <div class="page-head">
+        <div>${viewTitle('settings', esc(t('view.settings')))}<p>${esc(t('view.settings.desc'))}</p></div>
+      </div>
+      ${warn}
+      ${defaultBox}
+      <div class="set-grid">${cards}</div>
+      <div class="card" style="margin-top:var(--gap)"><div class="body tiny muted">${esc(t('set.footNote'))}</div></div>
+    `;
+  }},
 };
 
 /* ---------- 片段 ---------- */
 
-function noProject() { return `<div class="page-head"><div>${viewTitle('projects', '项目入口')}</div></div><div class="card"><div class="empty"><h2>先创建一个项目</h2><div class="tiny">前往「项目」创建，或点击下方按钮。<br><br><button class="btn primary" data-view="projects">去创建项目</button></div></div></div>`; }
+/** Settings 视图：单张 provider 卡片的渲染。表单字段在 SETTINGS_DRAFT[id] 里（每张卡一个），草稿在 SSE 重渲染时不丢。 */
+function providerCard(p) {
+  const d = SETTINGS_DRAFT[p.id] || {};
+  // 表单字段：缺省 = 当前 provider 的值
+  const name = (d.name !== undefined) ? d.name : p.name;
+  const enabled = (d.enabled !== undefined) ? d.enabled : p.enabled;
+  const apiStyle = (d.apiStyle !== undefined) ? d.apiStyle : p.apiStyle;
+  const baseUrl = (d.baseUrl !== undefined) ? d.baseUrl : p.baseUrl;
+  const apiKey = (d.apiKey !== undefined) ? d.apiKey : (p.hasKey ? p.apiKeyMasked : '');
+  const models = (d.models !== undefined) ? d.models : p.models.slice();
+  const defaultModel = (d.defaultModel !== undefined) ? d.defaultModel : p.defaultModel;
+  const showKey = !!d.showKey;
+  const testing = !!d.testing;
+  const testRes = d.testResult || null;            // {ok, ms, extra, err, sample} | null
+  const dirty = isDirty(p, d);
+
+  const styleOpts = [['openai', t('set.style.openai')], ['anthropic', t('set.style.anthropic')]]
+    .map(([v, n]) => `<option value="${esc(v)}"${v === apiStyle ? ' selected' : ''}>${esc(n)}</option>`).join('');
+
+  const modelChips = '';   // 旧 chip 已废；保留变量名避免下游引号错位
+  const modelsText = models.join('\n');
+
+  // 状态徽标只显示 key 情况（启用与否看右上角开关）：head 里不再重复「已启用/未启用」字样
+  const status = p.hasKey
+    ? `<span class="pill ok">${esc(t('set.hasKey'))}</span>`
+    : `<span class="pill warn">${esc(t('set.noKey'))}</span>`;
+
+  return `
+    <div class="card set-card" data-provider="${esc(p.id)}">
+      <div class="head">
+        <span class="nm" title="${esc(name)}">${esc(name)}</span>
+        <span class="pill">${esc(p.id)}</span>
+        <span class="pill mono">${esc(apiStyle)}</span>
+        ${status}
+      </div>
+      <label class="set-toggle" title="${esc(t('set.enabled'))}">
+        <input type="checkbox" data-field="enabled" ${enabled ? 'checked' : ''}>
+        <span class="set-toggle-dot"></span>
+        <span class="set-toggle-text">${esc(t('set.enabled'))}</span>
+      </label>
+      <div class="hint">${esc(p.hint || '')}</div>
+      ${p.id === 'minimax' ? `<div class="set-warn" style="margin:4px 0 2px">${esc(t('set.baseUrl.cnio'))}</div>` : ''}
+      <div class="row"><label class="lb">${esc(t('set.apiStyle'))}</label>
+        <select class="field" data-field="apiStyle">${styleOpts}</select>
+      </div>
+      <div class="row"><label class="lb">${esc(t('set.baseUrl'))}</label>
+        <input class="field" type="text" data-field="baseUrl" value="${esc(baseUrl)}" spellcheck="false">
+      </div>
+      <div class="row"><label class="lb">${esc(t('set.apiKey'))}</label>
+        <input class="field" type="${showKey ? 'text' : 'password'}" data-field="apiKey"
+               value="${esc(apiKey)}" placeholder="${esc(t('set.apiKey.ph'))}" autocomplete="off" spellcheck="false">
+        <button class="btn" data-toggle-key="${esc(p.id)}" style="margin-left:6px">${esc(showKey ? t('set.apiKey.hide') : t('set.apiKey.show'))}</button>
+      </div>
+      <div class="row" style="align-items:flex-start"><label class="lb">${esc(t('set.models'))}<span class="models-count">(${models.length})</span></label>
+        <div style="flex:1;display:flex;flex-direction:column;gap:6px">
+          <textarea class="field models-text" rows="${Math.min(Math.max(models.length + 1, 3), 10)}"
+            data-models-textarea="${esc(p.id)}" spellcheck="false"
+            placeholder="${esc(t('set.models.placeholder'))}">${esc(modelsText)}</textarea>
+          <div class="hint">${esc(t('set.models.hint'))}</div>
+          <div class="row" style="gap:6px;margin-top:2px">
+            <label class="lb" style="min-width:auto">${esc(t('set.defaultModel'))}</label>
+            <select class="field" data-field="defaultModel" style="max-width:260px">
+              ${models.map(m => `<option value="${esc(m)}"${m === defaultModel ? ' selected' : ''}>${esc(m)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+      </div>
+      <div class="footer">
+        <div class="footer-top">
+          <span class="hint preview">${esc(t('set.preview', { count: enabled && p.hasKey ? models.length : 0 }))}</span>
+        </div>
+        <div class="footer-actions">
+          <button class="btn" data-test-provider="${esc(p.id)}" ${testing ? 'disabled' : ''}>${testing ? esc(t('set.testing')) : esc(t('set.test'))}</button>
+          <button class="btn primary" data-save-provider="${esc(p.id)}" ${dirty ? '' : 'disabled'}>${esc(t('set.save'))}</button>
+          <button class="btn danger" data-clear-provider="${esc(p.id)}" ${p.hasKey ? '' : 'disabled'}>${esc(t('set.clear'))}</button>
+        </div>
+      </div>
+      ${testRes ? (testRes.ok
+        ? `<div class="test-result ok">${esc(t('set.test.ok', { ms: testRes.ms, extra: testRes.style === 'openai' ? t('set.test.openai', { n: testRes.count }) : t('set.test.anthropic', { m: testRes.model }) }))}<span class="sample mono tiny">${esc((testRes.sample || []).join(', '))}</span></div>`
+        : `<div class="test-result fail">${esc(t('set.test.fail', { err: testRes.err }))}</div>`) : ''}
+    </div>`;
+}
+
+/** 该 provider 的表单是否被改动（决定保存按钮的 disabled）。 */
+function isDirty(p, d) {
+  const fields = ['name', 'enabled', 'apiStyle', 'baseUrl', 'models', 'defaultModel'];
+  for (const f of fields) {
+    if (d[f] === undefined) continue;                                  // 用户没碰过
+    if (f === 'models') {
+      const a = d.models || [], b = p.models;
+      if (a.length !== b.length || a.some((x, i) => x !== b[i])) return true;
+    } else if (d[f] !== p[f]) return true;
+  }
+  // apiKey：空字符串/掩码回显 = 没改动；新写的明文 = 改动
+  if (d.apiKey !== undefined && d.apiKey !== '' && d.apiKey !== p.apiKeyMasked && d.apiKey !== p.apiKey) return true;
+  return false;
+}
+
+/** 写入表单字段（同时改 settingsDraft）。 */
+function setDraftField(id, field, value) {
+  const d = settingsDraft(id);
+  d[field] = value;
+}
+
+/* 从 model chip / input 拿一个干净的模型名：去前后空格；空就 null。 */
+const cleanModel = (s) => { const m = String(s || '').trim(); return m || null; };
+
+function noProject() { return `<div class="page-head"><div>${viewTitle('projects', t('nav.projects'))}</div></div><div class="card"><div class="empty"><h2>${esc(t('msg.noProject'))}</h2><div class="tiny">${esc(t('msg.goCreate'))}<br><br><button class="btn primary" data-view="projects">${esc(t('act.create'))}</button></div></div></div>`; }
 
 /** 某个阶段用哪个模型：定义过就选中它，没定义就落在「缺省」。改动即时保存（下一次调用生效）。 */
 function modelSelect(p, stageId) {
   const cur = (p.models || {})[stageId] || '';
-  const opts = cur && !MODEL_OPTS.includes(cur) ? [cur, ...MODEL_OPTS] : MODEL_OPTS;   // 服务端存了别的模型也照实显示
+  // enabled provider × model 的笛卡尔积 → "providerId/modelName"
+  const opts = ENABLED_MODELS.map(modelKey);
+  // 老数据 / 用户手动键入了未启用 provider 的模型：保留显示，别静默吞
+  if (cur && !opts.includes(cur)) opts.unshift(cur);
   return `<select class="field" data-stage-model="${esc(stageId)}"${p.stages.some(s => s.status === 'running' && s.id === stageId) ? ' disabled' : ''}>
     <option value=""${cur ? '' : ' selected'}>${esc(t('stage.model.default', { m: DB.default_model || 'deepseek-v4-flash' }))}</option>
     ${opts.map(m => `<option value="${esc(m)}"${m === cur ? ' selected' : ''}>${esc(m)}</option>`).join('')}
@@ -607,6 +786,7 @@ const VIEW_ICO = {
   code: ICO('<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M10 12l-2 2 2 2M14 12l2 2-2 2"/>'),
   runs: STAGE_ICO.operations,
   skills: ICO('<path d="M4 5a2 2 0 012-2h13v18H6a2 2 0 01-2-2z"/><path d="M8 3v18"/>'),
+  settings: ICO('<rect x="3" y="5" width="18" height="5" rx="1.2"/><rect x="3" y="14" width="18" height="5" rx="1.2"/><path d="M7 7.5h.01M7 16.5h.01M11 7.5h6M11 16.5h6"/>'),
 };
 const viewTitle = (id, text) => `<h1>${tico(VIEW_ICO[id])}${text}</h1>`;
 
@@ -653,7 +833,7 @@ const stageBadge = (s) => {
   const eyes = r.eyes === 'pulse'
     ? '<path d="M8.4 11h2l1-2.1 1.3 4.2 1.1-2.1h1.8" fill="none" stroke="#fff" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>'
     : ROBOT_EYES(r.eyes);
-  return `<span class="bot" style="--c:${r.c}" title="${esc(s.agent || 'AI Agent')} 执行">`
+  return `<span class="bot" style="--c:${r.c}" title="${esc(s.agent || 'AI Agent')} · ${esc(t('act.run'))}">`
     + `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="var(--c)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">`
     + `${r.ant}${ROBOT_HEAD(r.head)}${eyes}${r.arms || ''}${ROBOT_BODY}</svg></span>`;
 };
@@ -668,7 +848,8 @@ function pipe(p) {
       <div class="n">${String(i + 1).padStart(2, '0')}</div>
       <div class="ico">${STAGE_ICO[s.id] || ''}</div>
       <div class="t">${esc(stageLabel(s))}</div>
-      <div class="meta">${s.status === 'running' ? '<span class="pulse"></span>' : ''}<span>${STS[s.status].t}</span></div>
+      <div class="meta"><span>${STS[s.status].t}</span></div>
+      ${executionBar(stageExecution(p, s), stageLabel(s), true)}
     </div>`).join('')}</div>`;
 }
 
@@ -676,18 +857,18 @@ function tlClass(kind) { return kind === 'gate' ? 'warn' : kind === 'test' ? 'ok
 
 function gatePanel(p, st, compact) {
   const s = st || summary(p).cur;
-  if (!s) return `<div class="gate"><div class="gt">✓ 全流程完成</div><div class="gd">所有阶段与模块均已批准。</div></div>`;
+  if (!s) return `<div class="gate"><div class="gt">${esc(t('gate.allDone'))}</div><div class="gd">${esc(t('gate.allDoneDesc'))}</div></div>`;
 
   if (s.kind === 'development') {
     const rev = p.modules.filter(m => m.status === 'awaiting_review');
     const run = p.modules.filter(m => m.status === 'running');
-    if (!rev.length) return `<div class="gate"><div class="gt">开发阶段 · 多 Agent 并行</div><div class="gd">${run.length ? `${run.length} 个 Agent 正在开发：${run.map(m => `${esc(m.agent)}→${esc(m.id)}`).join('、')}` : '等待前序阶段批准后自动开发。'} 已完成 ${p.modules.filter(m => m.status === 'approved').length}/${p.modules.length}。审批入口在「WBS / 开发 → 模块开发」。</div></div>`;
-    return moduleGate(p, rev[0], compact) + (rev.length > 1 ? `<div class="hint">同时还有 ${rev.length - 1} 个模块待批准，可逐个处理（并行开发，批准不要求顺序）。</div>` : '');
+    if (!rev.length) return `<div class="gate"><div class="gt">${esc(t('gate.devStage'))}</div><div class="gd">${run.length ? esc(t('gate.agentsWorking', { n: run.length, agents: run.map(m => `${m.agent}→${m.id}`).join(' / ') })) : esc(t(s.status === 'approved' ? 'gate.allDoneDesc' : s.status === 'failed' ? 'dev.failed' : 'gate.waitPrev'))} ${esc(t('gate.devSummary', { done: p.modules.filter(m => m.status === 'approved').length, total: p.modules.length }))}</div></div>`;
+    return moduleGate(p, rev[0], compact) + (rev.length > 1 ? `<div class="hint">${esc(t('wbs.moreReviews', { n: rev.length - 1 }))}</div>` : '');
   }
   if (s.status === 'failed') return `<div class="gate" style="border-color:color-mix(in oklab,var(--fail) 45%,var(--line));background:var(--fail-dim)">
-    <div class="gt" style="color:var(--fail)">✕ 执行失败</div>
-    <div class="gd">${esc(s.error || '（无详情）')}</div>
-    <div class="acts"><button class="btn" data-run-stage="${esc(s.id)}">↻ 重试</button></div></div>`;
+    <div class="gt" style="color:var(--fail)">${esc(t('dev.failed'))}</div>
+    <div class="gd">${esc(s.error || '(no details)')}</div>
+    <div class="acts"><button class="btn" data-run-stage="${esc(s.id)}">${esc(t('dev.retry'))}</button></div></div>`;
   if (s.status === 'awaiting_review') {
     if (S.reject && S.reject.kind === 'stage' && S.reject.id === s.id) return rejectForm('stage', s.id);
     return `<div class="gate">
@@ -698,7 +879,7 @@ function gatePanel(p, st, compact) {
         <button class="btn danger" data-reject-stage="${esc(s.id)}">✕ ${esc(t('act.reject'))}</button>
       </div></div>`;
   }
-  if (s.status === 'running') return `<div class="gate" style="border-color:var(--line);background:var(--panel-2)"><div class="gt" style="color:var(--run)"><span class="pulse"></span>${esc(s.agent)} ${esc(t('st.running'))}…</div><div class="gd">${esc(t('gate.needsReview'))}</div></div>`;
+  if (s.status === 'running') return `<div class="gate" style="border-color:var(--line);background:var(--panel-2)"><div class="gt" style="color:var(--run)">${esc(s.agent)} ${esc(t('st.running'))}…</div>${st ? '' : executionBar(s, stageLabel(s))}</div>`;
   if (s.status === 'approved') return `<div class="gate" style="border-color:color-mix(in oklab,var(--ok) 40%,var(--line));background:var(--ok-dim)"><div class="gt" style="color:var(--ok)">✓ ${esc(t('st.approved'))}</div><div class="gd">${esc(s.review?.by || t('gate.reviewBy'))} · ${fmtTime(s.review?.at)}</div></div>`;
   return `<div class="gate" style="border-color:var(--line);background:var(--panel-2)"><div class="gt" style="color:var(--muted)">${esc(t('st.pending'))}</div><div class="gd">${esc(t('gate.waitPrev'))}<button class="btn" data-run-stage="${esc(s.id)}" style="margin-left:8px">▶ ${esc(t('act.run'))}</button></div></div>`;
 }
@@ -706,8 +887,8 @@ function gatePanel(p, st, compact) {
 function rejectForm(kind, id) {
   const r = S.reject;
   return `<div class="gate">
-    <div class="gt">✕ 驳回并退回重做</div>
-    <div><label class="lb">原因分类</label>
+    <div class="gt">${esc(t('gate.rejectTitle'))}</div>
+    <div><label class="lb">${esc(t('gate.rejectReason'))}</label>
       <select class="field" data-reject-cat>${REJECT_CATS.map(([v, k]) => `<option value="${esc(v)}" ${r.category === v ? 'selected' : ''}>${esc(t(k))}</option>`).join('')}</select></div>
     <div><label class="lb">${esc(t('gate.rejectComment'))}</label>
       <textarea class="field" data-reject-comment placeholder="${esc(t('gate.rejectHint'))}">${esc(r.comment || '')}</textarea></div>
@@ -737,47 +918,48 @@ function devSection(p) {
   const running = p.modules.filter(m => m.status === 'running');
   const rows = p.modules.map(m => {
     const ut = m.unit_tests;
-    return `<div class="mod-row ${m.id === S.module ? 'sel' : ''}" data-module="${esc(m.id)}">
+    return `<div class="mod-row ${m.id === S.module ? 'sel' : ''} ${m.status === 'running' ? 'run' : ''}" data-module="${esc(m.id)}">
       <span class="mid">${esc(m.id)}</span>
-      <span class="mn">${esc(m.name)}</span>
+      <div class="mod-name"><span class="mn">${esc(m.name)}</span>${executionBar(m, m.name, true)}</div>
       <span>${pill(m.status, MSTS)}</span>
-      <span class="mt">${ut ? `单测 ${ut.passed}/${ut.total} · 退出码 ${ut.exit_code}` : '—'}</span>
+      <span class="mt">${ut ? esc(t('dev.modUnit', { p: ut.passed, t: ut.total, c: ut.exit_code })) : '—'}</span>
       <span class="mt">${esc(m.agent || m.epic)}</span>
     </div>`;
-  }).join('') || '<div class="empty tiny">WBS 尚未完成，暂无模块</div>';
+  }).join('') || `<div class="empty tiny">${esc(t('wbs.noModules'))}</div>`;
   const sel = p.modules.find(m => m.id === S.module) || p.modules.find(m => m.status === 'awaiting_review') || p.modules[0];
   if (sel) S.module = sel.id;
   const ut = sel?.unit_tests;
   return `<div class="grid g-side g-dev g-fill">
-    <div class="card"><header><h2>模块开发</h2><span class="kicker">多 Agent 并行 · 并发 ${DB.runtime?.concurrency ?? 1} · ${esc(profLabel(p))}</span><span class="right mono tiny muted">${p.modules.filter(m => m.status === 'approved').length}/${p.modules.length} 批准${running.length ? ` · ${running.length} 个 Agent 开发中` : ''}</span></header>
+    <div class="card"><header><h2>${esc(t('wbs.devHeader'))}</h2><span class="kicker">${esc(t('wbs.devKicker', { conc: DB.runtime?.concurrency ?? 1 }))} · ${esc(profLabel(p))}</span><span class="right mono tiny muted">${esc(t('wbs.approvedCount', { done: p.modules.filter(m => m.status === 'approved').length, total: p.modules.length }))}${running.length ? esc(t('dev.devCount', { n: running.length })) : ''}</span></header>
       <div class="body flush">${rows}</div>
       ${running.length ? `<div class="foot">${running.map(m => `${esc(m.agent)} → ${esc(m.id)} ${esc(m.name)}`).join(' ｜ ')}</div>` : ''}</div>
     <div class="card"><header><h2>${sel ? esc(sel.name) : '—'}</h2><span class="kicker mono">${sel ? esc(sel.id) : ''}</span><span class="right">${sel ? pill(sel.status, MSTS) : ''}</span></header>
       <div class="body insp">
+        ${sel ? executionBar(sel, t('progress.execution')) : ''}
         ${sel ? (S.reject && S.reject.kind === 'module' && S.reject.id === sel.id ? rejectForm('module', sel.id)
           : sel.status === 'awaiting_review' ? moduleGate(p, sel)
-          : sel.status === 'failed' ? `<div class="gate" style="border-color:color-mix(in oklab,var(--fail) 45%,var(--line));background:var(--fail-dim)"><div class="gt" style="color:var(--fail)">✕ 执行失败</div><div class="gd">${esc(sel.error || '（无详情）')}</div><div class="acts"><button class="btn" data-run-module="${esc(sel.id)}">↻ 重试</button></div></div>`
-          : `<div class="gate" style="border-color:var(--line);background:var(--panel-2)"><div class="gt" style="color:var(--ink-2)">${MSTS[sel.status].t}</div><div class="gd">${sel.status === 'pending' ? '等待前序模块批准后自动开发。' : sel.status === 'approved' ? `已批准 · ${esc(sel.review?.by || '')} · ${fmtTime(sel.review?.at)}` : '执行中…'}</div>${sel.status === 'pending' && isNextModule(p, sel) ? `<div class="acts"><button class="btn" data-run-module="${esc(sel.id)}">▶ 开始开发</button></div>` : ''}</div>`) : ''}
+          : sel.status === 'failed' ? `<div class="gate" style="border-color:color-mix(in oklab,var(--fail) 45%,var(--line));background:var(--fail-dim)"><div class="gt" style="color:var(--fail)">${esc(t('dev.failed'))}</div><div class="gd">${esc(sel.error || t('dev.noDetail'))}</div><div class="acts"><button class="btn" data-run-module="${esc(sel.id)}">${esc(t('dev.retry'))}</button></div></div>`
+          : `<div class="gate" style="border-color:var(--line);background:var(--panel-2)"><div class="gt" style="color:var(--ink-2)">${MSTS[sel.status].t}</div><div class="gd">${esc(sel.status === 'pending' ? t('dev.waitPrevModule') : sel.status === 'approved' ? t('dev.approvedAt', { by: sel.review?.by || '', at: fmtTime(sel.review?.at) }) : t('dev.running'))}</div>${sel.status === 'pending' && isNextModule(p, sel) ? `<div class="acts"><button class="btn" data-run-module="${esc(sel.id)}">${esc(t('dev.start'))}</button></div>` : ''}</div>`) : ''}
         ${sel && sel.dir ? `<div class="kv">
-            <div class="k">语言档案</div><div class="v mono">${esc(profLabel(p, sel))}</div>
-            <div class="k">架构层</div><div class="v mono">${esc(sel.layer || '—')}</div>
-            <div class="k">代码位置</div><div class="v mono">${esc(sel.dir)}/</div>
-            <div class="k">测试位置</div><div class="v mono">${esc(sel.test_path_planned || sel.test_path || '—')}</div>
+            <div class="k">${esc(t('dev.profile'))}</div><div class="v mono">${esc(profLabel(p, sel))}</div>
+            <div class="k">${esc(t('code.layer'))}</div><div class="v mono">${esc(sel.layer || '—')}</div>
+            <div class="k">${esc(t('code.dir'))}</div><div class="v mono">${esc(sel.dir)}/</div>
+            <div class="k">${esc(t('dev.testPath'))}</div><div class="v mono">${esc(sel.test_path_planned || sel.test_path || '—')}</div>
           </div><div class="hr"></div>` : ''}
         ${ut ? `<div class="kv">
-            <div class="k">单元测试</div><div class="v mono">PASS=${ut.passed} FAIL=${ut.failed} 退出码=${ut.exit_code} ${ut.ms}ms</div>
-            <div class="k">命令</div><div class="v mono">${esc(ut.cmd || '')}</div>
-            <div class="k">执行时间</div><div class="v mono">${fmtTime(ut.at)}</div>
+            <div class="k">${esc(t('code.unitTests'))}</div><div class="v mono">PASS=${ut.passed} FAIL=${ut.failed} exit=${ut.exit_code} ${ut.ms}ms</div>
+            <div class="k">${esc(t('dev.cmd'))}</div><div class="v mono">${esc(ut.cmd || '')}</div>
+            <div class="k">${esc(t('dev.testAt'))}</div><div class="v mono">${fmtTime(ut.at)}</div>
           </div>` : ''}
-        ${sel && sel.files?.length ? `<div class="hr"></div><div class="list">${sel.files.map(f => `<div class="row"><span class="nm mono tiny">${esc(f.path)}</span><span class="num">${f.loc} 行</span></div>`).join('')}</div>` : ''}
-        ${sel && sel.review?.decision === 'rejected' ? `<div class="hr"></div><div class="gate"><div class="gt">✕ 驳回记录</div><div class="gd">〔${esc(sel.review.category)}〕${esc(sel.review.comment || '')}</div></div>` : ''}
+        ${sel && sel.files?.length ? `<div class="hr"></div><div class="list">${sel.files.map(f => `<div class="row"><span class="nm mono tiny">${esc(f.path)}</span><span class="num">${esc(t('msg.lines', { n: f.loc }))}</span></div>`).join('')}</div>` : ''}
+        ${sel && sel.review?.decision === 'rejected' ? `<div class="hr"></div><div class="gate"><div class="gt">${esc(t('dev.rejectLog'))}</div><div class="gd">〔${esc(sel.review.category)}〕${esc(sel.review.comment || '')}</div></div>` : ''}
       </div></div>
   </div>`;
 }
 function isNextModule(p, m) { return p.modules.find(x => x.status === 'pending' || x.status === 'rejected')?.id === m.id; }
 
 function wbsSummary(p) {
-  return `<div class="prose">${md(`# WBS 任务分解\n\n共 ${p.wbs.epics.length} 个 Epic / ${p.wbs.task_count} 个 Task。\n\n` + p.wbs.epics.map(e => `## ${e.id} ${e.name}\n目标：${e.goal}\n` + e.tasks.map(t => `- ${t.id} ${t.name}（\`${t.files}\`）`).join('\n')).join('\n\n'))}</div>`;
+  return `<div class="prose">${md(`# WBS Breakdown\n\n${p.wbs.epics.length} Epics / ${p.wbs.task_count} Tasks.\n\n` + p.wbs.epics.map(e => `## ${e.id} ${e.name}\nGoal: ${e.goal}\n` + e.tasks.map(t => `- ${t.id} ${t.name} (\`${t.files}\`)`).join('\n')).join('\n\n'))}</div>`;
 }
 
 /* ============================ 交互 ============================ */
@@ -798,23 +980,28 @@ function render(keepScroll) {
   document.getElementById('navArtifacts').textContent = p ? allArtifacts(p).length : 0;
   document.getElementById('navCode').textContent = p ? p.modules.reduce((n, m) => n + (m.files || []).length, 0) : 0;
   document.getElementById('navSkills').textContent = p ? (p.skills || []).length : 0;
-  document.getElementById('chipMode').textContent = (p ? (p.mode === 'auto' ? 'AI 自动审批' : '人工审批') : '—')
-    + (DB.runtime ? ` · 并发 ${DB.runtime.concurrency}` : '');
+  const ns = document.getElementById('navSettings');
+  if (ns) {
+    const enabled = (SETTINGS_CACHE && SETTINGS_CACHE.providers) ? SETTINGS_CACHE.providers.filter(x => x.enabled && x.hasKey).length : 0;
+    ns.textContent = enabled || '—';
+    ns.title = enabled ? `${enabled} provider enabled` : 'no provider enabled';
+  }
+  document.getElementById('chipMode').textContent = t('top.chipMode', { mode: p ? t(p.mode === 'auto' ? 'proj.mode.autoShort' : 'proj.mode.humanShort') : '—', conc: DB.runtime?.concurrency ?? 1 });
   document.getElementById('chipChan').textContent = DB.channel
-    ? (DB.channel.channel === 'live' ? `模型 ${DB.channel.model}` : '离线模板通道')
+    ? (DB.channel.channel === 'live' ? t('top.chipChanModel', { m: DB.channel.model }) : t('code.offlineChannel'))
     : '—';
   if (p) {
     const s = summary(p);
     const running = p.stages.some(x => x.status === 'running') || p.modules.some(m => m.status === 'running');
     document.getElementById('footData').textContent = t('proj.stats', { done: s.done, total: s.total, md: s.modDone, mt: s.modTotal, unit: s.unit, cur: running ? t('st.running') : t('st.allDone') });
     document.getElementById('footSrc').textContent = `${p.id} · ${p.events.length} ${t('kpi.events')}`;
-    document.getElementById('liveText').textContent = running ? `${t('st.running')}…` : t('top.idle');
-    document.querySelector('#livebar .mono').innerHTML = running ? '<span class="pulse"></span>' : '⌁';
   }
+  renderLiveProgress();
   window.scrollTo(0, keepScroll ? y : 0);
   // 深链 / SSE 重渲染到「工作区文件」或「源码」时，文件列表还没拉过就补一次（否则左树空着）
   if (p && (v === 'code' || (v === 'artifacts' && (S.artTab || 'artifacts') === 'files')) && wsStale(p)) refreshWorkspace(p);
   if (v === 'skills' && !CATALOG && !catalogLoading) loadCatalog();     // 预设技能库：进页面时拉一次
+  if (v === 'settings' && !SETTINGS_CACHE) refreshAll();                 // Settings：进页面时拉一次
 }
 
 function go(view) { S.view = view; S.reject = null; location.hash = view; render(); }
@@ -827,6 +1014,80 @@ window.addEventListener('hashchange', () => {
 
 document.addEventListener('click', (e) => {
   const el = (sel) => e.target.closest(sel);
+
+  /* ===== LLM 服务 / Settings ===== */
+  const setDefaultBtn = el('[data-set-default]');
+  if (setDefaultBtn) {
+    const v = document.getElementById('setDefaultSel')?.value || '';
+    return act(async () => { await api.post('/api/settings/default', { providerId: v }); }, true);
+  }
+  const toggleKey = el('[data-toggle-key]');
+  if (toggleKey) {
+    const id = toggleKey.dataset.toggleKey;
+    setDraftField(id, 'showKey', !((SETTINGS_DRAFT[id]) || {}).showKey);
+    return render(true);
+  }
+  const addModelBtn = el('[data-add-model]');
+  if (addModelBtn) return;   // 旧 chip 路径已废——保留入口只为了不再误命中
+  const delModel = el('[data-del-model]');
+  if (delModel) return;      // 同上
+  const testBtn = el('[data-test-provider]');
+  if (testBtn) {
+    const id = testBtn.dataset.testProvider;
+    const d = settingsDraft(id);
+    d.testing = true; d.testResult = null;
+    render(true);
+    return act(async () => {
+      try {
+        const r = await api.post(`/api/settings/providers/${id}/test`, {});
+        d.testing = false; d.testResult = { ok: true, ms: r.ms, style: r.style, count: r.count, sample: r.sample, model: r.model };
+        // 自动同步：OpenAI 兼容的 provider 在测通后把列表从 /v1/models 拿回来；
+        // 不清空——用户已编辑的内容会被覆盖；想保留就在「测试」前手动复制走。
+        if (r.style === 'openai' && Array.isArray(r.sample) && r.sample.length) {
+          d.models = r.sample.slice();
+          if (!r.sample.includes(d.defaultModel || '')) d.defaultModel = r.sample[0];
+          // 列表变了 → 重新渲染让用户看到结果；textarea 的失焦不是问题（用户点完 Test 就看结果）
+          render(true);
+        }
+      } catch (e) {
+        d.testing = false; d.testResult = { ok: false, err: e.message };
+      }
+    }, true);
+  }
+  const saveBtn = el('[data-save-provider]');
+  if (saveBtn) {
+    const id = saveBtn.dataset.saveProvider;
+    const p = SETTINGS_CACHE.providers.find(x => x.id === id);
+    if (!p) return;
+    const d = settingsDraft(id);
+    const body = {};
+    if (d.name !== undefined && d.name !== p.name) body.name = d.name;
+    if (d.enabled !== undefined && d.enabled !== p.enabled) body.enabled = !!d.enabled;
+    if (d.apiStyle !== undefined && d.apiStyle !== p.apiStyle) body.apiStyle = d.apiStyle;
+    if (d.baseUrl !== undefined && d.baseUrl !== p.baseUrl) body.baseUrl = d.baseUrl;
+    if (d.models !== undefined && (d.models.length !== p.models.length || d.models.some((m, i) => m !== p.models[i]))) {
+      body.models = d.models; body.defaultModel = d.defaultModel || p.defaultModel;
+    } else if (d.defaultModel !== undefined && d.defaultModel !== p.defaultModel) {
+      body.defaultModel = d.defaultModel;
+    }
+    if (d.apiKey !== undefined && d.apiKey !== '' && d.apiKey !== p.apiKeyMasked && d.apiKey !== p.apiKey) {
+      body.apiKey = d.apiKey;
+    }
+    return act(async () => {
+      await api.put(`/api/settings/providers/${id}`, body);
+      // 保存成功 → 清掉该 provider 的草稿，避免下次进来看到旧状态
+      delete SETTINGS_DRAFT[id];
+    }, true);
+  }
+  const clearBtn = el('[data-clear-provider]');
+  if (clearBtn) {
+    const id = clearBtn.dataset.clearProvider;
+    const p = SETTINGS_CACHE.providers.find(x => x.id === id);
+    if (!p) return;
+    if (!confirm(t('set.confirmClear', { name: p.name }))) return;
+    return act(async () => { await api.post(`/api/settings/providers/${id}/clear`, {}); }, true);
+  }
+
   const nav = el('#nav .navbtn, [data-view]');
   if (nav && nav.dataset.view) return go(nav.dataset.view);
   if (el('[data-goflow]')) return go('flow');
@@ -851,7 +1112,7 @@ document.addEventListener('click', (e) => {
     return act(async () => {
       try { await api.post(`/api/projects/${id}/rebuild`, {}); }
       catch (e) {
-        if (!/正在执行中/.test(e.message)) throw e;
+        if (!/Project is running/.test(e.message)) throw e;
         if (!confirm(`${e.message}\n\n${t('proj.rebuild.force')}`)) return;
         await api.post(`/api/projects/${id}/rebuild`, { force: true });
       }
@@ -863,12 +1124,12 @@ document.addEventListener('click', (e) => {
   if (del) {
     const id = del.dataset.delProject;
     const proj = DB.projects.find(x => x.id === id);
-    if (!confirm(`删除项目「${proj ? proj.name : id}」？\n\n会同时删除它的全部状态与 workspace/${id}/ 下生成的文件，不可恢复。`)) return;
+    if (!confirm(`Delete project "${proj ? proj.name : id}"?\n\nThis deletes all its state and generated files under workspace/${id}/. Irreversible.`)) return;
     return act(async () => {
       try { await api.del(`/api/projects/${id}`); }
       catch (e) {
-        if (!/正在执行中/.test(e.message)) throw e;
-        if (!confirm(`${e.message}\n\n现在强制删除？`)) return;
+        if (!/Project is running/.test(e.message)) throw e;
+        if (!confirm(`${e.message}\n\nForce-delete now?`)) return;
         await api.del(`/api/projects/${id}?force=1`);
       }
       if (S.project === id) S.project = null;
@@ -953,7 +1214,7 @@ document.addEventListener('click', (e) => {
   const sd = el('[data-skill-del]');
   if (sd) {
     const sk = (P()?.skills || []).find(x => x.id === sd.dataset.skillDel);
-    if (!confirm(`删除技能「${sk ? sk.name : sd.dataset.skillDel}」？\n\n删除后新的模型调用不再带这条约定（已生成的产物不受影响）。`)) return;
+    if (!confirm(`Delete skill "${sk ? sk.name : sd.dataset.skillDel}"?\n\nIt will no longer be sent to new model calls (existing artifacts unaffected).`)) return;
     return act(() => api.del(`/api/projects/${S.project}/skills/${sd.dataset.skillDel}`));
   }
   const sa = el('[data-save-art]');
@@ -961,30 +1222,30 @@ document.addEventListener('click', (e) => {
     const key = 'art:' + sa.dataset.saveArt;
     const p = P(); const a = allArtifacts(p).find(x => x.id === sa.dataset.saveArt);
     const text = DRAFT.key === key ? DRAFT.text : (a ? a.content : '');
-    return act(async () => { await api.post(`/api/projects/${S.project}/artifacts/${sa.dataset.saveArt}`, { content: text, editor: '人工' }); S.editArt = null; DRAFT = { key: null, text: '' }; });
+    return act(async () => { await api.post(`/api/projects/${S.project}/artifacts/${sa.dataset.saveArt}`, { content: text, editor: 'Manual' }); S.editArt = null; DRAFT = { key: null, text: '' }; });
   }
   const sf = el('[data-save-file]');
   if (sf) {
     const key = 'file:' + sf.dataset.saveFile;
     const text = DRAFT.key === key ? DRAFT.text : (WS.content || '');
     return act(async () => {
-      const r = await api.put(`/api/projects/${S.project}/file`, { path: sf.dataset.saveFile, content: text, editor: '人工' });
+      const r = await api.put(`/api/projects/${S.project}/file`, { path: sf.dataset.saveFile, content: text, editor: 'Manual' });
       S.editFile = null; DRAFT = { key: null, text: '' };
       await refreshWorkspace(P());                    // 刷新文件列表与模块状态
       await openFile(P(), sf.dataset.saveFile);       // 重新读回刚保存的内容（否则预览还停在旧文本）
-      if (r && r.test) alert(`已保存并重跑该模块单测：PASS=${r.test.passed} FAIL=${r.test.failed} 退出码=${r.test.exit_code}`);
+      if (r && r.test) alert(t('msg.savedTests', { p: r.test.passed, f: r.test.failed, e: r.test.exit_code }));
     });
   }
 
   // 门禁
   const ap = el('[data-approve-stage]');
-  if (ap) return act(() => api.post(`/api/projects/${S.project}/stages/${ap.dataset.approveStage}/approve`, { reviewer: '人工审核' }));
+  if (ap) return act(() => api.post(`/api/projects/${S.project}/stages/${ap.dataset.approveStage}/approve`, { reviewer: 'Manual review' }));
   const rj = el('[data-reject-stage]');
   if (rj) { S.reject = { kind: 'stage', id: rj.dataset.rejectStage, category: REJECT_CATS[0], comment: '' }; return render(true); }
   const rs = el('[data-run-stage]');
   if (rs) return act(() => api.post(`/api/projects/${S.project}/stages/${rs.dataset.runStage}/run`, {}));
   const am = el('[data-approve-module]');
-  if (am) return act(() => api.post(`/api/projects/${S.project}/modules/${am.dataset.approveModule}/approve`, { reviewer: '人工审核' }));
+  if (am) return act(() => api.post(`/api/projects/${S.project}/modules/${am.dataset.approveModule}/approve`, { reviewer: 'Manual review' }));
   const rm = el('[data-reject-module]');
   if (rm) { S.reject = { kind: 'module', id: rm.dataset.rejectModule, category: REJECT_CATS[0], comment: '' }; return render(true); }
   const runm = el('[data-run-module]');
@@ -993,7 +1254,7 @@ document.addEventListener('click', (e) => {
   if (send) {
     const [kind, id] = send.dataset.rejectSend.split(':');
     const path = kind === 'stage' ? `/api/projects/${S.project}/stages/${id}/reject` : `/api/projects/${S.project}/modules/${id}/reject`;
-    const body = { category: S.reject.category, comment: S.reject.comment, reviewer: '人工审核' };
+    const body = { category: S.reject.category, comment: S.reject.comment, reviewer: 'Manual review' };
     S.reject = null;
     return act(() => api.post(path, body));
   }
@@ -1004,6 +1265,40 @@ document.addEventListener('input', (e) => {
   if (e.target.matches('[data-edit-area]')) DRAFT = { key: DRAFT.key, text: e.target.value };
   if (e.target.matches('[data-reject-comment]')) S.reject.comment = e.target.value;
   if (e.target.matches('[data-reject-cat]')) S.reject.category = e.target.value;
+  /* LLM 服务表单：草稿同步到 SETTINGS_DRAFT，方便 SSE/重渲染不丢 */
+  const f = e.target.closest('[data-provider]');
+  if (f && e.target.matches('[data-field]')) {
+    const id = f.dataset.provider;
+    const field = e.target.dataset.field;
+    let v = e.target.value;
+    if (field === 'enabled') return;                       // enabled 是 checkbox，走 change
+    if (field === 'models') return;                        // models 走加/删，不在这里编辑
+    setDraftField(id, field, v);
+  }
+  /* 模型列表 textarea：手动改 → 同步 d.models + 同步「默认模型」下拉选项 + 改 count 徽标；
+     不走 render()——否则会丢光标（在输一半的时候换框很不舒服） */
+  const ta = f && f.querySelector('[data-models-textarea]');
+  if (f && ta && e.target === ta) {
+    const id = ta.dataset.modelsTextarea;
+    const lines = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+    setDraftField(id, 'models', lines);
+    const cnt = f.querySelector('.models-count');
+    if (cnt) cnt.textContent = `(${lines.length})`;
+    const sel = f.querySelector('select[data-field="defaultModel"]');
+    const cur = sel ? sel.value : '';
+    if (sel) sel.innerHTML = lines.map(m => `<option value="${esc(m)}"${m === cur ? ' selected' : ''}>${esc(m)}</option>`).join('');
+    if (sel && lines.length && !lines.includes(cur)) {
+      setDraftField(id, 'defaultModel', lines[0]);
+      sel.value = lines[0];
+    }
+    // 「保存」按钮可点性：让 isDirty 重新判断（不重渲染只调一下）
+    const saveBtn = f.querySelector('[data-save-provider]');
+    if (saveBtn) {
+      const d2 = SETTINGS_DRAFT[id] || {};
+      const p2 = SETTINGS_CACHE.providers.find(x => x.id === id);
+      saveBtn.disabled = !p2 || !isDirty(p2, d2);
+    }
+  }
 });
 
 document.addEventListener('input', (e) => {          // 技能表单：边打字边存草稿（SSE 刷新/重渲染不丢）
@@ -1019,6 +1314,17 @@ document.addEventListener('change', (e) => {
     if (inEdit) EPICKS = [...e.target.files]; else PICKS = [...e.target.files];
     return render(true);
   }
+  /* LLM 服务表单：enabled 开关、协议下拉、默认模型下拉 */
+  const f = e.target.closest('[data-provider]');
+  if (f && e.target.matches('[data-field]')) {
+    const id = f.dataset.provider;
+    const field = e.target.dataset.field;
+    let v;
+    if (field === 'enabled') v = e.target.checked;
+    else v = e.target.value;
+    setDraftField(id, field, v);
+    return render(true);                                    // 立刻让「保存」按钮可点
+  }
   const sm = e.target.closest('[data-stage-model]');
   if (sm && S.project) return act(() => api.post(`/api/projects/${S.project}/models`, { models: { [sm.dataset.stageModel]: sm.value } }));
 });
@@ -1029,10 +1335,10 @@ async function readPicks(list) {
   for (const file of (list || []).slice(0, 10)) {
     if (file.size > 262144) { skipped.push(`${file.name}（>256KB）`); continue; }
     const content = await file.text();
-    if (content.includes('\u0000')) { skipped.push(`${file.name}（二进制）`); continue; }
+    if (content.includes('\u0000')) { skipped.push(t('msg.binaryFile', { name: file.name })); continue; }
     files.push({ name: file.name, content });
   }
-  if (skipped.length) alert('已跳过：' + skipped.join('、'));
+  if (skipped.length) alert(t('msg.skipped') + skipped.join(' / '));
   return files;
 }
 
@@ -1041,7 +1347,7 @@ document.addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
     const id = e.target.dataset.skillId;
-    const body = { name: f.get('name'), body: f.get('body'), stage: f.get('stage') || '', editor: '人工' };
+    const body = { name: f.get('name'), body: f.get('body'), stage: f.get('stage') || '', editor: 'Manual' };
     S.skillEdit = null;
     SKDRAFT = { name: '', body: '', stage: '' };
     await act(() => id
@@ -1104,9 +1410,21 @@ document.addEventListener('change', (e) => {      // 工作流 / 执行模式：
 
 async function act(fn, keepForm) {
   try { await fn(); }
-  catch (err) { alert('操作失败：' + err.message); }
-  const r = await api.get('/api/state'); DB = r; if (DB.active && !P()) S.project = DB.active;
+  catch (err) { alert(t('msg.actionFailed', { e: err.message })); }
+  await refreshAll();
   render(!keepForm);
+}
+
+/** 拉一次 /api/state + /api/settings + /api/settings/enabled-models；settings 没改时也会重拉——开销可忽略。 */
+async function refreshAll() {
+  const [r, s, m] = await Promise.all([
+    api.get('/api/state'),
+    api.get('/api/settings').catch(() => null),
+    api.get('/api/settings/enabled-models').catch(() => null),
+  ]);
+  DB = r; if (DB.active && !P()) S.project = DB.active;
+  SETTINGS_CACHE = s || SETTINGS_CACHE;
+  ENABLED_MODELS = (m && m.models) || ENABLED_MODELS;
 }
 
 const api = {
@@ -1146,7 +1464,7 @@ async function refreshWorkspace(p) {
       await openFile(p, pick.path);
     }
     else render(true);
-  } catch (e) { WS.loading = false; WS.modCount = -1; alert('读取工作区失败：' + e.message); render(true); }
+  } catch (e) { WS.loading = false; WS.modCount = -1; alert(t('msg.wsFailed', { e: e.message })); render(true); }
 }
 
 async function openFile(p, rel) {
@@ -1154,7 +1472,7 @@ async function openFile(p, rel) {
   try { const r = await api.get(`/api/projects/${p.id}/file?path=${encodeURIComponent(rel)}`); WS.path = r.path; WS.content = r.content; }
   catch (e) {
     if (WS.path === rel) { WS.path = null; WS.content = ''; S.editFile = null; }   // 文件读不到就别留着旧内容
-    alert('读取文件失败：' + e.message);
+    alert(t('msg.fileFailed', { e: e.message }));
   }
   render(true);
 }
@@ -1195,7 +1513,7 @@ function scheduleReload() {
   reloadT = setTimeout(async () => {
     const focused = document.activeElement && document.activeElement.closest('form');
     const dirty = SKDRAFT.name || SKDRAFT.body || SKDRAFT.stage;      // 技能表单里正打着字
-    try { DB = await api.get('/api/state'); if (DB.active && !P()) S.project = DB.active; } catch { return; }
+    try { await refreshAll(); if (DB.active && !P()) S.project = DB.active; } catch { return; }
     if (focused || dirty) { renderFooterOnly(); return; }   // 正在填表单：SSE 刷新只更新页脚，别把用户手里的表单换掉
     render(true);
   }, 150);
@@ -1203,14 +1521,15 @@ function scheduleReload() {
 function renderFooterOnly() {
   const p = P(); if (!p) return;
   const s = summary(p);
-  document.getElementById('footData').textContent = `${s.done}/${s.total} 阶段 · ${s.modDone}/${s.modTotal} 模块 · 单测 ${s.unit}`;
+  document.getElementById('footData').textContent = t('proj.stats', { done: s.done, total: s.total, md: s.modDone, mt: s.modTotal, unit: s.unit, cur: s.cur ? STS[s.cur.status].t : t('st.allDone') });
+  renderLiveProgress();
 }
 
 (async function boot() {
   try { const t = localStorage.getItem(LS + 'theme'); if (t) document.documentElement.dataset.theme = t; const d = localStorage.getItem(LS + 'density'); if (d) document.documentElement.dataset.density = d; const lg = localStorage.getItem(LS + 'lang'); if (lg) setLang(lg); } catch {}
   try { const ql = new URLSearchParams(location.search).get('lang'); if (ql) setLang(ql); } catch {}   // ?lang=en 便于截图/分享
   buildLangSelect(); applyStatic(); syncTweaks();
-  try { DB = await api.get('/api/state'); } catch (e) { alert(t('msg.connectingFailed', { e: e.message })); }
+  try { await refreshAll(); } catch (e) { alert(t('msg.connectingFailed', { e: e.message })); }
   if (DB.active) S.project = DB.active; else if (DB.projects[0]) S.project = DB.projects[0].id;
   const h = location.hash.replace('#', ''); if (VIEWS[h]) S.view = h;
   try {  // URL 覆盖（截图 / 分享用）：?view=flow&wbstab=dev&project=ID
@@ -1227,9 +1546,9 @@ function renderFooterOnly() {
   render();
   try {
     const es = new EventSource('/api/stream');
-    es.onopen = () => { document.getElementById('liveText').textContent = '实时连接 · 已建立'; };
+    es.onopen = () => { const el = document.getElementById('liveText'); el.dataset.i18n = 'top.live'; el.textContent = t('top.live'); };
     es.onmessage = () => scheduleReload();
-    es.onerror = () => { document.getElementById('liveText').textContent = '实时连接中断，重连中…'; };
+    es.onerror = () => { const el = document.getElementById('liveText'); el.dataset.i18n = 'top.reconnecting'; el.textContent = t('top.reconnecting'); };
     window.addEventListener('pagehide', () => { try { es.close(); } catch {} });   // 页面走了就主动断开，别占着同源并发槽
   } catch {}
 })();

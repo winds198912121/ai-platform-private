@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as H from './harness.mjs';
 import * as exec from './exec.mjs';
+import * as settings from './settings.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -21,7 +22,7 @@ try {
   if (prev.pid && prev.pid !== process.pid) {
     let alive = true;
     try { process.kill(prev.pid, 0); } catch (e) { alive = e.code !== 'ESRCH'; }
-    if (alive) { console.error(`[server] 已有实例在跑（pid ${prev.pid}，数据 ${H.DATA_FILE}）→ 退出，避免两份内存副本互相覆盖`); process.exit(1); }
+    if (alive) { console.error(`[server] Another instance is running (pid ${prev.pid}, data ${H.DATA_FILE}); exiting to prevent conflicting writes`); process.exit(1); }
   }
 } catch {}
 fs.writeFileSync(LOCK, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), data: H.DATA_FILE }));
@@ -45,18 +46,24 @@ const readBody = (req) => new Promise((resolve) => { let b = ''; req.on('data', 
 
 const routes = [
   ['GET', /^\/api\/state$/, () => ({ ...H.state(), channel: H.channelInfo(), runtime: H.runtimeInfo(), stages: H.stagesMeta(), workflows: H.WORKFLOWS, types: H.TYPES, default_model: H.DEFAULT_MODEL })],
+  ['GET', /^\/api\/settings$/, () => settings.getAllPublic()],
+  ['GET', /^\/api\/settings\/enabled-models$/, () => ({ models: settings.listEnabledModels(), defaultProvider: (settings.getDefaultProvider() || {}).id || '' })],
+  ['PUT', /^\/api\/settings\/providers\/([^/]+)$/, async (m, body) => settings.setProvider(m[1], body || {})],
+  ['POST', /^\/api\/settings\/providers\/([^/]+)\/test$/, async (m) => settings.testProvider(m[1])],
+  ['POST', /^\/api\/settings\/providers\/([^/]+)\/clear$/, async (m) => settings.clearProvider(m[1])],
+  ['POST', /^\/api\/settings\/default$/, async (m, body) => settings.setDefaultProvider((body || {}).providerId || '')],
   ['GET', /^\/api\/projects\/([^/]+)$/, (m) => H.must(m[1])],
   ['GET', /^\/api\/projects\/([^/]+)\/workspace$/, (m) => { const p = H.must(m[1]); return { files: exec.listFiles(exec.wsDir(p.id)).map(f => ({ path: f, bytes: fs.statSync(path.join(exec.wsDir(p.id), f)).size })) }; }],
   ['GET', /^\/api\/projects\/([^/]+)\/file$/, (m, body, url) => {
     const p = H.must(m[1]);
     const rel = exec.safeRel(url.searchParams.get('path'));
-    if (!rel) throw new H.HttpError(400, '非法路径');
+    if (!rel) throw new H.HttpError(400, 'Invalid path');
     const abs = path.join(exec.wsDir(p.id), rel);
-    if (!fs.existsSync(abs)) throw new H.HttpError(404, '文件不存在');
+    if (!fs.existsSync(abs)) throw new H.HttpError(404, 'File not found');
     return { path: rel, content: fs.readFileSync(abs, 'utf8') };
   }],
-  ['PUT', /^\/api\/projects\/([^/]+)\/file$/, async (m, body) => { const p = H.must(m[1]); return H.editWorkspaceFile(p, body.path, body.content, { editor: body.editor || '人工' }); }],
-  ['POST', /^\/api\/projects\/([^/]+)\/artifacts\/([^/]+)$/, async (m, body) => { const p = H.must(m[1]); return H.editArtifact(p, m[2], { content: body.content, editor: body.editor || '人工' }); }],
+  ['PUT', /^\/api\/projects\/([^/]+)\/file$/, async (m, body) => { const p = H.must(m[1]); return H.editWorkspaceFile(p, body.path, body.content, { editor: body.editor || 'Human' }); }],
+  ['POST', /^\/api\/projects\/([^/]+)\/artifacts\/([^/]+)$/, async (m, body) => { const p = H.must(m[1]); return H.editArtifact(p, m[2], { content: body.content, editor: body.editor || 'Human' }); }],
   ['POST', /^\/api\/projects$/, async (m, body) => H.createProject(body)],
   ['PUT', /^\/api\/projects\/([^/]+)$/, (m, body) => H.updateProject(H.must(m[1]), body)],
   ['POST', /^\/api\/projects\/([^/]+)\/inputs$/, (m, body) => H.addInputs(H.must(m[1]), body && body.files)],

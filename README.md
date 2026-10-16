@@ -57,6 +57,10 @@ Project entry (name / brief / tech stack / execution mode)
 
 **Execution mode**: `human_gate` (default, every step waits for human approval) / `auto` (gates auto-pass; for demoing the full pipeline).
 
+Execution progress appears in the top bar, pipeline stages, and module list/details. Percentages follow execution checkpoints (preparation, generation, file output, and tests), rather than elapsed time. Model calls keep their last confirmed percentage while awaiting a response. Failed attempts retain their last checkpoint in red; retries start at zero. Development progress averages all modules. A task at 100% has finished executing and may still require human approval.
+
+The supported display languages are Japanese and English; Japanese is the default, including fallback for legacy locale preferences. Preset skills and generated templates use Japanese or English. Model prompts require Japanese prose with English technical identifiers, and exclude model reasoning from displayed artifacts. Generated Python bytecode caches are omitted from the source browser.
+
 **Workflows (harness variants — pick based on client project needs)**: when creating a new project, you pick a workflow which decides which stages the project runs (more stages ⇒ more complete delivery, but more time and tokens). 8 presets are preconfigured (one row per workflow in `harness.mjs`'s `WORKFLOWS`; add a new one by adding a row):
 
 | id | Name | Stages |
