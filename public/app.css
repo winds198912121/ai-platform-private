@@ -872,3 +872,6 @@ iframe.proto { display: block; width: 1290px; max-width: none; height: 70vh; min
 .cmp pre.asis { margin: 0 0 4px; max-height: 70vh; overflow: auto; font: 400 11px/1.45 var(--font-mono); background: var(--panel-2); border: 1px solid var(--line); padding: 8px; white-space: pre; }
 .cmp img.tobe, .cmp img.asis-img { display: block; width: 100%; border: 1px solid var(--line); background: #fff; margin-bottom: 6px; }
 @media (max-width: 1100px) { .cmp { grid-template-columns: 1fr; } }
+
+/* 「起動」ボタン：全工程完了時は状態が一目で分かるように（disabled のまま色だけ抑える） */
+.btn.run.done { background: #2f7d52; color: #fff; border-color: #2f7d52; opacity: .75; }

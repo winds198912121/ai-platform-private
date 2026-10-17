@@ -346,6 +346,8 @@ const DICT = {
   'proj.run.allDone':     ['All stages approved — nothing to run', '全ステージ承認済み — 起動できる段階はありません'],
   'proj.run.error':       ['Failed to start: {msg}', '起動失敗: {msg}'],
   'act.runProject':       ['▶ Run', '▶ 起動'],
+  'act.runDone':          ['✓ Done', '✓ 完了'],
+  'proj.run.doneHint':    ['All stages approved. To run again, use Rebuild.', '全工程が承認済みです。もう一度実行するには「再ビルド」を使ってください。'],
 
   /* ---------- 总览 KPI ---------- */
   'kpi.progress':         ['Pipeline progress', 'パイプライン進捗'],

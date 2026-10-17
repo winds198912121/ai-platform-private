@@ -325,8 +325,10 @@ const VIEWS = {
     const cards = DB.projects.map(p => {
       const s = summary(p);
       const runnable = !s.done || s.done < s.total;
+      const complete = s.total > 0 && s.done === s.total;
       const running = !!(s.cur && s.cur.status === 'running');
       const runBtnTitle = runnable ? t('proj.run.title') : t('proj.run.allDone');
+      const runLabel = complete ? t('act.runDone') : t('act.runProject');
       const body = `
         <div class="pname" title="${esc(p.brief || '')}">${esc(p.name)}</div>
         <div class="progress"><i class="${s.done === s.total ? 'ok' : 'acc'}" style="width:${Math.round(s.progress * 100)}%"></i></div>
@@ -339,10 +341,11 @@ const VIEWS = {
         ${body}
         <div class="card-acts">
           <button class="btn" type="button" data-edit-project="${esc(p.id)}">${esc(t('act.edit'))}</button>
-          <button class="btn run" data-run-project="${esc(p.id)}" title="${esc(runBtnTitle)}"${runnable && !running ? '' : ' disabled'}>${esc(t('act.runProject'))}</button>
+          <button class="btn run${complete ? ' done' : ''}" data-run-project="${esc(p.id)}" title="${esc(runBtnTitle)}" aria-disabled="${runnable && !running ? 'false' : 'true'}"${runnable && !running ? '' : ' disabled'}>${esc(runLabel)}</button>
           <button class="btn warn" data-rebuild-project="${esc(p.id)}" title="${esc(t('proj.rebuild.title'))}">${esc(t('act.rebuild'))}</button>
           <button class="btn danger" data-del-project="${esc(p.id)}" title="${esc(t('proj.del.title'))}">${esc(t('act.delete'))}</button>
         </div>
+        ${complete ? `<div class="tiny muted">${esc(t('proj.run.doneHint'))}</div>` : ''}
       </div>`;
     }).join('') || `<div class="empty"><h2>${esc(t('proj.empty.title'))}</h2><div class="tiny">${esc(t('proj.empty.desc'))}</div></div>`;
 
