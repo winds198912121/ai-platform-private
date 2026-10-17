@@ -12,9 +12,12 @@ import { PROFILES, profileOf } from './exec.mjs';
 import * as settings from './settings.mjs';
 import * as exec from './exec.mjs';
 import * as G from './governance.mjs';
+import * as U from './usage.mjs';
 
 const TIMEOUT_MS = Number(process.env.AI_PLATFORM_TIMEOUT_MS || 180000);
-const MAX_OUT = 65536;             // 单次输出上限（重试时直接给满，不再小步试探）
+// 截断时的放大上限：以前直接给满 65536，结果「写太多 → 放得更多 → 写得更多」。现在最多翻一倍、封顶 32K；
+// 模块代码（growOnTruncate:false）截断就直接报 truncated，由调用方缩小输出重来。
+const GROW_CAP = 32768;
 
 /* ---------- 环境变量 key（向后兼容） ---------- */
 
@@ -103,49 +106,71 @@ async function chat(messages, opts = {}) {
   if (!provider) throw new ProviderError('No model API key configured (add a provider in LLM Providers, or set env var AI_PLATFORM_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY)');
   if (!provider.apiKey) throw new ProviderError(`provider "${provider.name}" has no API key`);
   model = model || provider.defaultModel || LEGACY_MODEL;
-  if (provider.apiStyle === 'anthropic') return callAnthropic(messages, { json, maxTokens, temperature, model, provider });
-  return callOpenAI(messages, { json, maxTokens, temperature, model, provider });
+  // D7 成本台账：每一次 HTTP 调用（含失败、截断、超时）都记 1 行，并回调 opts.onUsage（harness 用它累计模块预算）
+  const effort = process.env.AI_PLATFORM_REASONING_EFFORT || null;
+  const promptEst = U.estimateTokens(messages.map(m => m.content).join('\n'));
+  const meta = { project: opts.project?.id || null, stage: opts.stageId || null, module: opts.module || null, attempt: opts.attempt ?? null, mode: opts.mode || null, provider: provider.id || provider.name || null, model, effort };
+  const onCall = (u, err, ms, budget) => {
+    const rec = { ts: new Date().toISOString(), ...meta, max_tokens: budget, ...U.normalize(u), prompt_est: promptEst, outcome: U.outcomeOf(err), ms };
+    U.record(rec);
+    try { opts.onUsage?.(rec); } catch { /* 回调出错不影响主流程 */ }
+  };
+  const call = provider.apiStyle === 'anthropic' ? callAnthropic : callOpenAI;
+  return withRetry((budget) => call(messages, { json, maxTokens: budget, temperature, model, provider, effort }), { maxTokens, grow: opts.growOnTruncate !== false, onCall });
 }
+
+/** 重试只在这一层、只为「没拿到答案」重试：网络 / 429 / 5xx 重发 1 次；截断时（允许的话）预算翻倍重发 1 次。
+    超时、空响应、截断（不放大）直接抛给调用方——它们按 transient / 模块 attempt 处理，不在这里叠乘。 */
+async function withRetry(once, { maxTokens, grow, onCall }) {
+  let budget = maxTokens, netRetried = false, grown = false;
+  for (;;) {
+    const t0 = Date.now();
+    try {
+      const r = await once(budget);
+      onCall(r.usage, null, Date.now() - t0, budget);
+      return r;
+    } catch (e) {
+      onCall(e.usage, e, Date.now() - t0, budget);
+      if (e.code === 'truncated' && grow && !grown && budget < GROW_CAP) { grown = true; budget = Math.min(budget * 2, GROW_CAP); continue; }
+      if (!netRetried && isRetryableNet(e)) { netRetried = true; await new Promise(r => setTimeout(r, 1200)); continue; }
+      throw e;
+    }
+  }
+}
+const isRetryableNet = (e) => e.code !== 'truncated' && /fetch failed|ECONNRESET|socket hang up|returned (429|5\d\d)/i.test(String(e.message || e));
+
+const truncated = (msg, usage) => Object.assign(new ProviderError(msg), { code: 'truncated', usage });
 
 /* ---------- OpenAI 兼容（OpenAI / DeepSeek / MiniMax / 任何 OpenAI-风格代理） ---------- */
 
-async function callOpenAI(messages, { json, maxTokens, temperature, model, provider }) {
+async function callOpenAI(messages, { json, maxTokens, temperature, model, provider, effort }) {
   const base = String(provider.baseUrl || '').replace(/\/$/, '');
   const url = `${base}/chat/completions`;
-  let lastErr;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const budget = attempt === 1 ? maxTokens : MAX_OUT;
-    const body = { model, messages, max_tokens: budget, temperature, stream: false };
-    if (json) body.response_format = { type: 'json_object' };
-    // 思考量（DeepSeek V4.x / OpenAI o 系が受ける）。既定は送らない＝プロバイダ既定。
-    // AI_PLATFORM_REASONING_EFFORT=none|low|high|max で上書き（ない場合は未送信）。
-    if (process.env.AI_PLATFORM_REASONING_EFFORT) body.reasoning_effort = process.env.AI_PLATFORM_REASONING_EFFORT;
+  const body = { model, messages, max_tokens: maxTokens, temperature, stream: false };
+  if (json) body.response_format = { type: 'json_object' };
+  // 思考量（DeepSeek V4.x / OpenAI o 系が受ける）。既定は送らない＝プロバイダ既定。
+  // AI_PLATFORM_REASONING_EFFORT=none|low|high|max で上書き（ない場合は未送信）。
+  if (effort) body.reasoning_effort = effort;
 
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
-    try {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${provider.apiKey}` },
-        body: JSON.stringify(body),
-        signal: ac.signal,
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new ProviderError(`Model returned ${r.status}: ${j.error?.message || j.message || 'unknown'}`);
-      const choice = j.choices?.[0] || {};
-      const text = choice.message?.content || '';
-      if (!text.trim()) throw new ProviderError('Model returned empty content');
-      if (choice.finish_reason === 'length') {
-        lastErr = new ProviderError(`Model output truncated (finish_reason=length, hit ${budget} tokens)`);
-        continue;
-      }
-      return { text, usage: j.usage, model: j.model || model, finishReason: choice.finish_reason };
-    } catch (e) {
-      lastErr = e.name === 'AbortError' ? new ProviderError(`Model call timed out (${TIMEOUT_MS}ms)`) : e;
-    } finally { clearTimeout(timer); }
-    if (attempt === 1) await new Promise(r => setTimeout(r, 1200));
-  }
-  throw lastErr;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${provider.apiKey}` },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new ProviderError(`Model returned ${r.status}: ${j.error?.message || j.message || 'unknown'}`);
+    const choice = j.choices?.[0] || {};
+    const text = choice.message?.content || '';
+    if (choice.finish_reason === 'length') throw truncated(`Model output truncated (finish_reason=length, hit ${maxTokens} tokens)`, j.usage);
+    if (!text.trim()) throw Object.assign(new ProviderError('Model returned empty content'), { usage: j.usage });
+    return { text, usage: j.usage, model: j.model || model, finishReason: choice.finish_reason };
+  } catch (e) {
+    throw e.name === 'AbortError' ? new ProviderError(`Model call timed out (${TIMEOUT_MS}ms)`) : e;
+  } finally { clearTimeout(timer); }
 }
 
 /* ---------- Anthropic 兼容（Anthropic Claude / MiniMax Anthropic 端点） ---------- */
@@ -162,51 +187,42 @@ async function callAnthropic(messages, { json, maxTokens, temperature, model, pr
     else conv.push({ role: m.role, content: m.content });
   }
 
-  let lastErr;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const budget = attempt === 1 ? maxTokens : MAX_OUT;
-    const body = {
-      model,
-      max_tokens: budget,
-      temperature,
-      ...(system ? { system } : {}),
-      messages: conv,
-    };
+  const body = {
+    model,
+    max_tokens: maxTokens,
+    temperature,
+    ...(system ? { system } : {}),
+    messages: conv,
+  };
 
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
-    try {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': provider.apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify(body),
-        signal: ac.signal,
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new ProviderError(`Model returned ${r.status}: ${j.error?.message || j.message || 'unknown'}`);
-      // Anthropic response: { content: [{ type: 'text', text: '...' }], stop_reason, usage }
-      const blocks = Array.isArray(j.content) ? j.content : [];
-      const text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('');
-      if (!text.trim()) {
-        // 没有 text block 时把 thinking / tool_use 也作为错误信息暴露
-        const sample = blocks.slice(0, 2).map(b => `[${b.type}]`).join(',') || 'empty';
-        throw new ProviderError(`Model returned empty content（${sample}）`);
-      }
-      if (j.stop_reason === 'max_tokens') {
-        lastErr = new ProviderError(`Model output truncated (stop_reason=max_tokens, hit ${budget} tokens)`);
-        continue;
-      }
-      return { text, usage: j.usage, model: j.model || model, finishReason: j.stop_reason || 'stop' };
-    } catch (e) {
-      lastErr = e.name === 'AbortError' ? new ProviderError(`Model call timed out (${TIMEOUT_MS}ms)`) : e;
-    } finally { clearTimeout(timer); }
-    if (attempt === 1) await new Promise(r => setTimeout(r, 1200));
-  }
-  throw lastErr;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': provider.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new ProviderError(`Model returned ${r.status}: ${j.error?.message || j.message || 'unknown'}`);
+    // Anthropic response: { content: [{ type: 'text', text: '...' }], stop_reason, usage }
+    const blocks = Array.isArray(j.content) ? j.content : [];
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('');
+    if (j.stop_reason === 'max_tokens') throw truncated(`Model output truncated (stop_reason=max_tokens, hit ${maxTokens} tokens)`, j.usage);
+    if (!text.trim()) {
+      // 没有 text block 时把 thinking / tool_use 也作为错误信息暴露
+      const sample = blocks.slice(0, 2).map(b => `[${b.type}]`).join(',') || 'empty';
+      throw Object.assign(new ProviderError(`Model returned empty content（${sample}）`), { usage: j.usage });
+    }
+    return { text, usage: j.usage, model: j.model || model, finishReason: j.stop_reason || 'stop' };
+  } catch (e) {
+    throw e.name === 'AbortError' ? new ProviderError(`Model call timed out (${TIMEOUT_MS}ms)`) : e;
+  } finally { clearTimeout(timer); }
 }
 
 const stripFences = (t) => String(t).replace(/<think>[\s\S]*?<\/think>/gi, '').trim().replace(/^```[a-z]*\s*/i, '').replace(/```$/, '').trim();
@@ -655,7 +671,16 @@ export function moduleContext(project, mod, { reqCap = 6000, depCap = 8000 } = {
   return parts.join('');
 }
 
-export async function moduleCode(project, mod, feedback) {
+/** 模块调用公共选项：不放大截断预算（写太多就该缩小，不是给更多）、带上模块/轮次，usage 回调给 harness 记预算。 */
+const modOpts = (project, mod, call, extra) => ({ json: true, project, stageId: 'development', growOnTruncate: false, module: mod.id, attempt: call.attempt ?? null, onUsage: call.onUsage, ...extra });
+
+/** 模型输出 → JSON；失败抛「不是合法 JSON」（算进模块 attempt，不当瞬时故障白送重试）。 */
+function parseModuleJSON(text, what) {
+  try { return parseJSON(text, what); }
+  catch { throw new ProviderError(`${what}: model output is not valid JSON (${String(text).length} characters)`); }
+}
+
+export async function moduleCode(project, mod, feedback, call = {}) {
   const stack = (project.arch && project.arch.stack) || project.tech || 'Node.js';
   const profile = profileOf(stack);
   const dir = mod.dir || `src/${mod.layer || 'core'}`;
@@ -680,22 +705,15 @@ ${spec.rules}
 5. ${spec.test}
 6. 每files ≤ 150 行；被测函数要导出（Java 用 public static）。
 7. 単体テスト要确实覆盖任务清单里的行为，断言要具体（断言值，不要只 check("ok", true) / assert.ok(x)）。${cds}
-9. 原文に無い・矛盾する・解釈が分かれる業務ルール（端数処理、境界値、コード値、例外時の扱いなど）は**推測で決めず** questions に挙げる（関係する要件 ID 付き、1 件 1 論点、最大 5 件）。それでも files / test は現時点の最善の草稿として出す（人の回答後に作り直す）。疑問が無ければ questions は [] にする。
-10. 只输出 JSON：
+9. テスト内で CREATE TABLE を書く場合、**実装が実際に INSERT/SELECT する列名・型・制約と完全に一致**させること（存在しない列へ INSERT しない、NOT NULL 列は必ず値を入れる、ON CONFLICT を使うなら対応する UNIQUE 制約を定義する）。実装側の SQL を先に決め、それに合わせてテストの DDL を書く。
+10. 原文に無い・矛盾する・解釈が分かれる業務ルール（端数処理、境界値、コード値、例外時の扱いなど）は**推測で決めず** questions に挙げる（関係する要件 ID 付き、1 件 1 論点、最大 5 件）。それでも files / test は現時点の最善の草稿として出す（人の回答後に作り直す）。疑問が無ければ questions は [] にする。
+11. 只输出 JSON：
 {"summary":"本模块实现了什么","files":[{"path":"${dir}/<业务文件名>${exFile}","content":"..."}],"test":{"path":"${testPath}","content":"..."},"questions":[{"req_ids":["<要件 ID>"],"text":"<人に確認したいこと>"}]${profile.deps ? ',"deps":["<许可清单内的包名>"]' : ''}}`;
   const budget = profile.id === 'java' || profile.id === 'cap-java' ? 24000 : profile.deps ? 16000 : 8000;
-  let out = null, usage = null, model = null, text = '';
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const retryNote = attempt === 1 ? '' : `\n\n上一次返回不合格：${!out ? 'JSON 解析失败' : (!(out.files || []).length ? 'files 为空' : '缺少 test 字段（必须是 {path, content}）')}。这次务必带上 test，且保证 JSON 完整：必要时减少源码文件数、精简每段代码，宁可少而全，不要多而缺。`;
-    const r = await chat(
-      [{ role: 'system', content: sys }, { role: 'user', content: user + retryNote }],
-      { json: true, maxTokens: budget, temperature: attempt === 1 ? 0.2 : 0.1, project, stageId: 'development' },
-    );
-    text = r.text; usage = r.usage; model = r.model;
-    try { out = parseJSON(text, `Module ${mod.id} code`); } catch (e) { out = null; if (attempt === 2) throw e; continue; }
-    if ((out.files || []).length && out.test && typeof out.test.content === 'string') break;
-    if (attempt === 2) break;
-  }
+  // 重试只在 harness 一层：形不正 / 截断 → 抛错 → 下一轮带「缩小输出」的反馈（lastFeedback）重来
+  const r = await chat([{ role: 'system', content: sys }, { role: 'user', content: user }], modOpts(project, mod, call, { maxTokens: budget, temperature: 0.2, mode: 'full' }));
+  const { text, usage, model } = r;
+  const out = parseModuleJSON(text, `Module ${mod.id} code`);
   const files = Array.isArray(out && out.files) ? out.files : [];
   const test = out && out.test && typeof out.test.content === 'string' ? out.test : null;
   const shape = ` (fields: ${Object.keys(out || {}).join(', ') || 'none'}; files=${files.length}${test ? '' : '; test is missing or is not {path,content}'}; ${text.length} characters)`;
@@ -704,6 +722,59 @@ ${spec.rules}
   const questions = Array.isArray(out.questions) ? out.questions : [];
   const deps = profile.deps && Array.isArray(out.deps) ? out.deps.map(String).slice(0, 20) : [];
   return { summary: String(out.summary || '').slice(0, 300), files, test, questions, deps, usage, model, profile: profile.id };
+}
+
+/* ---------- 差分修正（再試行用・トークン削減の要） ----------
+
+   失敗したモジュールを「最初から作り直す」のではなく、既存ファイルと落ちたテストだけを
+   渡して**変更が必要なファイルだけ**返させる。通常の moduleCode が入力 ~30K 文字 /
+   出力 ~40K tokens なのに対し、こちらは入力 ~8K / 出力 4〜8K を想定。
+
+   返り値：{ summary, patches:[{path, content}], test?:{path, content}, questions[], usage, model }
+   patches が空 = 変更不要（harness 側で「修正なし」として扱う）。
+*/
+export async function modulePatch(project, mod, { files = [], test = null, failure = null } = {}, call = {}) {
+  const stack = (project.arch && project.arch.stack) || project.tech || 'Node.js';
+  const profile = profileOf(stack);
+  const dir = mod.dir || `src/${mod.layer || 'core'}`;
+  const testPath = (test && test.path) || mod.test_path || mod.test_path_planned || testPathOf(profile, mod.layer || 'core', 0, mod.name);
+
+  const fileBlocks = files.map(f => `### ${f.path}\n\`\`\`\n${String(f.content || '').slice(0, 12000)}\n\`\`\``).join('\n\n');
+  const testBlock = test && test.content ? `\n### ${test.path}\n\`\`\`\n${String(test.content).slice(0, 8000)}\n\`\`\`` : '';
+  const fail = failure ? `〔${failure.category || 'test'}〕${String(failure.comment || '').slice(0, 2400)}` : '（失敗内容の記録なし）';
+
+  const sys = `あなたは実装の修正担当です。既存コードを壊さず、テストが通る最小の変更だけを行います。`;
+  const user = `プロジェクト：${project.name}（${stack}）
+モジュール：${mod.name}（層 ${mod.layer || 'core'}、ソースは ${dir}/ 直下）
+モジュール目標：${mod.goal || '（未設定）'}
+
+## 失敗内容
+${fail}
+
+## 現時点の実装ファイル
+${fileBlocks || '（まだファイルがありません）'}${testBlock}
+
+## 出力ルール（厳守）
+1. **変更が必要なファイルだけ**を patches に入れる。変更しないファイルは含めない。
+2. 可能な限り最小差分にする（全面書き換えしない。無関係な整形・改名をしない）。
+3. テスト自体に誤りがある場合だけ test を返す（実装をテストに合わせて壊さない）。テストの CREATE TABLE は実装の INSERT/SELECT 列と完全一致させる（未知の列・NOT NULL 欠落・ON CONFLICT 用 UNIQUE 欠落を残さない）。
+4. 新しいファイルが必要なら patches に追加してよい（パスは ${dir}/ 直下、業務名で）。
+5. 仕様の曖昧点は questions に（最大 3 件、要件 ID 付き）。推測で大きく変えない。
+6. JSON のみを返す：
+{"summary":"何を直したか","patches":[{"path":"${dir}/<name>${profile.ext}","content":"..."}],"test":{"path":"${testPath}","content":"..."} ,"questions":[]}
+（test が不要なら "test":null）`;
+
+  const { text, usage, model } = await chat([{ role: 'system', content: sys }, { role: 'user', content: user }], modOpts(project, mod, call, { maxTokens: 12000, temperature: 0.1, mode: 'patch' }));
+  const out = parseModuleJSON(text, `Module ${mod.id} patch`);
+  const patches = Array.isArray(out && out.patches) ? out.patches.filter(x => x && typeof x.path === 'string' && typeof x.content === 'string') : [];
+  const t = out && out.test && typeof out.test.content === 'string' && typeof out.test.path === 'string' ? out.test : null;
+  return {
+    summary: String((out && out.summary) || '').slice(0, 300),
+    patches: patches.slice(0, 40),
+    test: t,
+    questions: Array.isArray(out && out.questions) ? out.questions : [],
+    usage, model, profile: profile.id, mode: 'patch',
+  };
 }
 
 /* ---------- UX：デザインシステム（1 回）と重要画面のハイファイ内容（画面ごと） ---------- */

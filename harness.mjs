@@ -245,7 +245,7 @@ export function load() {
       pushEvent(p, { stage: 'development', kind: 'error', text: `⚠ ${parked.length}  module(s) marked awaiting-review despite failing tests (legacy)→ moved to failed and re-queued: ${parked.map(m => m.id).join('、')}` });
       syncDevelopment(p);
     }
-    if ((p.modules || []).some(m => m.status === 'failed' && (m.attempts || 0) < 3)) resume.add(p);   // 有可retry的failedmodule → 启动后接着跑
+    if ((p.modules || []).some(m => autoRetryable(p, m))) resume.add(p);   // 有可retry的failedmodule → 启动后接着跑
     else {
       const st = (p.stages || []).find(s => s.status === 'failed' && (s.attempts || 0) < 3);          // failedstage同理(retry封顶 3 attempts)
       if (st) resume.add(p);
@@ -269,13 +269,19 @@ export const state = () => db;
 export const get = (id) => db.projects.find(p => p.id === id);
 export function must(id) { const p = get(id); if (!p) throw new HttpError(404, `Project not found: ${id}`); return p; }
 export function currentStage(p) { return p.stages.find(s => s.status !== 'approved') || null; }
-const lastFeedback = (x) => {
+export const lastFeedback = (x) => {
   const fb = baseFeedback(x);
   if (!x.feedback) return fb;                     // 疑問への回答（影響分析で戻されたとき）は差し戻し・テスト結果と一緒に渡す
   return fb ? { category: `${x.feedback.category} + ${fb.category}`, comment: `${x.feedback.comment}\n${fb.comment}` } : x.feedback;
 };
+const SHAPE_ERR = /truncated|not valid JSON|no source files|no unit test/i;
 const baseFeedback = (x) => {
   if (x.review && x.review.decision === 'rejected') return { category: x.review.category, comment: x.review.comment };
+  // 上一轮输出被截断 / 不是合法 JSON / 缺文件：同样的预算重来，但要求缩小输出（以前是把 max_tokens 顶到 64K）
+  if (x.last_error && SHAPE_ERR.test(x.last_error)) return {
+    category: '出力形式エラー',
+    comment: `Previous output was rejected: ${x.last_error}. Return complete, valid JSON within the same budget: at most 6 source files, each ≤ 120 lines, no comments or explanations, include the test. Fewer complete files beat many truncated ones.`,
+  };
   // 自动retry：把上一轮**真实测试输出**喂回去，模型才知道哪断言挂了(否则只会盲目重生成)
   const u = x.unit_tests;
   if (u && (u.failed > 0 || u.exit_code !== 0 || !u.total)) {
@@ -290,8 +296,25 @@ const baseFeedback = (x) => {
   return null;
 };
 
+/* ---------- 模块 token 预算（设计书 D3）----------
+   回数だけでなく実消費で打ち切る：full 1 回 ≈ 60K + patch 3〜4 回を見込んで既定 150K。
+   p.token_budget.module > 环境变量 AI_PLATFORM_MODULE_TOKEN_BUDGET > 既定。人の差戻し・疑問回答で used はリセット（total は累計のまま）。 */
+export const DEFAULT_MODULE_TOKEN_BUDGET = 150000;
+export const moduleBudget = (p) => Number(p?.token_budget?.module) || Number(process.env.AI_PLATFORM_MODULE_TOKEN_BUDGET) || DEFAULT_MODULE_TOKEN_BUDGET;
+export const overBudget = (p, m) => ((m.tokens && m.tokens.used) || 0) >= moduleBudget(p);
+/** 台帳 1 行 → モジュールの消費に加算。usage が無い失敗呼び出しは入力推定で数える（タダにはしない）。 */
+export function addModuleTokens(m, rec) {
+  const n = rec.total != null ? rec.total : (rec.prompt_est || 0);
+  m.tokens = m.tokens || { used: 0, total: 0, calls: 0 };
+  m.tokens.used += n; m.tokens.total += n; m.tokens.calls += 1;
+}
+const resetModuleBudget = (m) => { if (m.tokens) m.tokens.used = 0; delete m.budget_exceeded; };
+/** 自動再試行してよい failed か：3 回未満 かつ 予算内。 */
+export const autoRetryable = (p, m) => m.status === 'failed' && (m.attempts || 0) < 3 && !overBudget(p, m);
+
 /** transient failure(空响应 / 网络 / 限流 / 网关)——不是模型的"答案"，不该吃掉 3 轮retry预算。 */
-export const isTransientModelError = (msg) => /empty content|EMPTY|Invalid JSON|Unexpected end|Unexpected token|timeout|timed out|ECONNRESET|fetch failed|socket hang up|\b429\b|\b50[234]\b/i.test(String(msg || ''));
+// JSON 不正・截断不再算瞬时：那是模型「写太多 / 写坏了」的答案，算进 attempt 与模块预算（设计书 D3）
+export const isTransientModelError = (msg) => /empty content|EMPTY|timeout|timed out|ECONNRESET|fetch failed|socket hang up|\b429\b|\b50[234]\b/i.test(String(msg || ''));
 
 /** transient failure统一处理(stage / module共用): 原地重排、attempts 回退，max 2 次；back true = 已按transient failure处理。 */
 export function transientBounce(p, x, stageId, label, msg) {
@@ -935,7 +958,7 @@ export function kick(p, opts = {}) {
       // 只领取"没做过"或"人reject"'s module；failedretrymax 3 轮，避免模型反复failed时无限循环
       // 依存(deps)が全部承認済みのものだけ着手：上位が mock 相手に先走らない(DAG 順)
       // 未回答の疑問に紐づくもの（on_hold / 担当 ID が重なる）は回答まで着手しない：曖昧な仕様の上に作らない
-      const next = p.modules.find(m => (m.status === 'pending' || m.status === 'rejected' || (m.status === 'failed' && (m.attempts || 0) < 3)) && !G.blockedBy(p, m).length && !G.heldBy(p, m).length);
+      const next = p.modules.find(m => (m.status === 'pending' || m.status === 'rejected' || autoRetryable(p, m)) && !G.blockedBy(p, m).length && !G.heldBy(p, m).length);
       if (!next) break;
       runModule(p, next, opts).catch(e => console.error('[harness]', e.message));
     }
@@ -1441,6 +1464,7 @@ export function checkModuleRunnable(p, moduleId) {
 export async function runModule(p, mod, opts = {}) {
   checkModuleRunnable(p, mod.id);
   const st = p.stages.find(s => s.id === 'development');
+  mod.last_error = mod.error || null;           // 上一轮的失败原因（截断 / JSON 不正 → 本轮要求缩小输出）
   mod.status = 'running'; mod.attempts += 1; mod.error = null;
   mod.agent = freeAgent(p);                      // 先占 Agent 槽位，事件里能看出是谁在做
   st.status = 'running'; st.started_at = st.started_at || now();
@@ -1457,11 +1481,49 @@ export async function runModule(p, mod, opts = {}) {
     pushEvent(p, { stage: 'development', kind: 'step', text: PROVIDER === 'sim' ? 'offline channel · generating template code' : ` calling ${modelFor(p, 'development')} to generate code + unit tests…` });
     setProg(35, 'generating code');
 
-    const code = PROVIDER === 'sim' ? sim.moduleCode(p, mod) : await agent.moduleCode(p, mod, lastFeedback(mod));
+    // 再試行（既存ファイルあり＋前回テスト失敗）は「差分修正モード」で送る。
+    // 全文再生成は 1 回 40K tokens かかるが、差分なら数 K で済む（設計書 §4.1）。
+    const hadFiles = (mod.files || []).length > 0;
+    const retryFix = hadFiles && mod.unit_tests && (mod.unit_tests.failed > 0 || mod.unit_tests.exit_code !== 0);
+    const readText = (rel) => { try { return fs.readFileSync(path.join(root, rel), 'utf8'); } catch { return ''; } };
+    const call = { attempt: mod.attempts, onUsage: (rec) => addModuleTokens(mod, rec) };
+    let code;
+    if (PROVIDER === 'sim') {
+      code = sim.moduleCode(p, mod);
+    } else if (retryFix) {
+      const existing = (mod.files || []).map(f => ({ path: f.path, content: readText(f.path) })).filter(x => x.content);
+      const test = mod.test_path ? { path: mod.test_path, content: readText(mod.test_path) } : null;
+      pushEvent(p, { stage: 'development', kind: 'step', text: `${mod.id}: patch mode (diff fix) — ${existing.length} existing file(s), ${(lastFeedback(mod) || {}).category || 'test'}` });
+      code = await agent.modulePatch(p, mod, { files: existing, test, failure: lastFeedback(mod) }, call);
+    } else {
+      code = await agent.moduleCode(p, mod, lastFeedback(mod), call);
+    }
     if (p._removed || !p.modules.includes(mod)) return;      // project已删 / 已被"重新构建"清掉：别把文件写回已清理的工作区
-    const testRel = exec.safeRel(code.test.path);
-    if (!testRel) throw new Error(`invalid test path from model: ${code.test.path}`);
-    mod.files = exec.writeFiles(root, [...code.files, code.test]);
+    let testRel, wrote;
+    if (Array.isArray(code.patches)) {
+      // 差分修正：変更ファイルだけ書き、mod.files にマージする
+      const dir = mod.dir || `src/${mod.layer || 'core'}`;
+      const writes = [];
+      for (const pt of code.patches) {
+        const rel0 = exec.safeRel(pt.path);
+        if (!rel0 || !rel0.startsWith(dir + '/')) continue;
+        writes.push({ path: rel0, content: pt.content });
+      }
+      if (code.test) { const tr = exec.safeRel(code.test.path); if (tr) writes.push({ path: tr, content: code.test.content }); }
+      if (!writes.length) throw new Error(`${mod.id}: patch mode returned no changes`);
+      wrote = exec.writeFiles(root, writes);
+      const map = new Map((mod.files || []).map(f => [f.path, f]));
+      for (const w of wrote) map.set(w.path, w);
+      mod.files = [...map.values()];
+      testRel = exec.safeRel((code.test && code.test.path) || mod.test_path || '');
+      code.files = writes.filter(w => w.path !== testRel);
+      if (code.test) pushEvent(p, { stage: 'development', kind: 'step', text: `${mod.id}: test updated by patch (${code.test.path})` });
+    } else {
+      testRel = exec.safeRel(code.test.path);
+      if (!testRel) throw new Error(`invalid test path from model: ${code.test.path}`);
+      wrote = exec.writeFiles(root, [...code.files, code.test]);
+      mod.files = wrote;
+    }
     if (!mod.files.length) throw new Error('model produced no writeable files');
     if (prof(p).deps) {                                          // 依存ありの栈：要求された依存を許可リストで篩って package.json に追記（版は平台固定）
       const pk = exec.ensurePackageJson(root, { stack: stackOf(p), deps: code.deps });
@@ -1519,7 +1581,8 @@ export async function runModule(p, mod, opts = {}) {
       } else {
         // 门禁不通过 = modulefailed(不是"等人批准"): 这样 kick() 才会重排retry，并把真实failed输出喂回模型
         const bad = (tr.tail || '').split('\n').filter(l => /^✖ /.test(l)).map(l => l.replace(/^✖ /, '').replace(/\s*\(\d[\d.]*ms\)\s*$/, '').trim()).slice(0, 3);
-        const more = (mod.attempts || 0) < 3 ? `→ Automatic retry (attempt ${(mod.attempts || 0) + 1}/3 attempts)` : '→ Three attempts failed. Inspect the actual output or reject the module to retry.';
+        const more = overBudget(p, mod) ? budgetNote(p, mod)
+          : (mod.attempts || 0) < 3 ? `→ Automatic retry (attempt ${(mod.attempts || 0) + 1}/3 attempts)` : '→ Three attempts failed. Inspect the actual output or reject the module to retry.';
         mod.status = 'failed';
         mod.error = (tr.timed_out
           ? `単体テストtimeout(${tr.ms}ms: test process did not exit; check open handles, timers, or pending promises)`
@@ -1535,6 +1598,11 @@ export async function runModule(p, mod, opts = {}) {
       pushEvent(p, { stage: 'development', kind: 'error', text: `✕ module ${mod.id}"${mod.name}"failed: ${mod.error}` });
     }
   }
+  if (mod.status === 'failed' && overBudget(p, mod) && !mod.budget_exceeded) {   // 予算超過：自動再試行を止めて人の判断へ
+    mod.budget_exceeded = true;
+    mod.error = `${mod.error || 'failed'} · token budget exceeded (${mod.tokens.used}/${moduleBudget(p)})`;
+    pushEvent(p, { stage: 'development', kind: 'gate', text: `⛔ module ${mod.id}"${mod.name}" ${budgetNote(p, mod)}` });
+  }
   if (mod.requeue) {                       // 実行中に関係する疑問が回答された：この結果は古い前提なので作り直す
     delete mod.requeue;
     mod.status = G.heldBy(p, mod).some(q => q.module === mod.id) ? 'on_hold' : 'pending';
@@ -1543,6 +1611,10 @@ export async function runModule(p, mod, opts = {}) {
   syncDevelopment(p);
   save();
   kick(p, opts);
+}
+
+function budgetNote(p, mod) {
+  return `→ Token budget exhausted (${(mod.tokens && mod.tokens.used) || 0}/${moduleBudget(p)} tokens, ${(mod.tokens && mod.tokens.calls) || 0} calls). Auto-retry stopped: inspect the output, then reject the module to retry (resets the budget), or split it in WBS.`;
 }
 
 function syncDevelopment(p) {
@@ -1562,7 +1634,7 @@ function syncDevelopment(p) {
     // 実行中として扱う（UI に「停止」と出て実態と食い違うのを防ぐ）。
     const canProgress = mods.some(m => m.status === 'running')
       || mods.some(m => ['pending', 'rejected'].includes(m.status))
-      || mods.some(m => m.status === 'failed' && (m.attempts || 0) < 3);
+      || mods.some(m => autoRetryable(p, m));
     st.status = canProgress ? 'running' : 'failed';
   }
   else if (mods.some(m => m.status === 'running')) st.status = 'running';
@@ -1668,6 +1740,7 @@ export function rejectModule(p, moduleId, { category = 'Uncategorized', comment 
   const wasApproved = mod.status === 'approved';               // 已批准也能撤回重做：后来发现它把同层别's module写坏了是常事
   const wasFailed = mod.status === 'failed';
   mod.status = 'rejected'; mod.version += 1; mod.attempts = (wasApproved || wasFailed) ? 0 : mod.attempts;   // 人给的机会不计入自动retry的 3 轮
+  resetModuleBudget(mod);                                      // 人の判断で再挑戦：予算もリセット（累計 total は残す）
   mod.review = { decision: 'rejected', by: reviewer, at: now(), category, comment };
   pushEvent(p, { stage: 'development', kind: 'gate', text: `✕ module ${mod.id}"${mod.name}"${wasApproved ? '(approved → retracted)' : ''}rejected [${category}]${comment ? '：' + comment : ''} → feedback fed to model, retrying` });
   if (String(comment).trim()) draftLesson(p, { from: 'rejection', ref: mod.id, stage: 'development', draft: G.lessonDraft({ kind: 'rejection', category, comment, module: mod.id, name: mod.name }) });
@@ -1728,7 +1801,7 @@ export function answerQuestion(p, qid, { answer = '', by = 'Human', source = 'di
     const had = m.status !== 'pending';
     m.status = G.heldBy(p, m).some(x => x.module === m.id) ? 'on_hold' : 'pending';
     if (had) m.version = (m.version || 1) + 1;
-    m.attempts = 0; m.error = null; delete m.transient;
+    m.attempts = 0; m.error = null; delete m.transient; resetModuleBudget(m);
     if (m.review && m.review.decision === 'rejected') delete m.review;  // 前回の差し戻しより回答を優先
     reset.push(id);
   }
