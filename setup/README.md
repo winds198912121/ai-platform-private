@@ -20,17 +20,22 @@ When a generated module needs a missing JDK or Python runtime, the platform atte
 
 ## First run
 
-```bash
-git clone https://github.com/winds198912121/ai-platform.git
-cd ai-platform
+Use your existing local checkout. To create another working copy, clone the private repository with a GitHub account that has access, then enter its directory:
 
+```bash
+git clone https://github.com/winds198912121/ai-platform-private.git ai-platform
+cd ai-platform
+```
+
+From the repository root:
+
+```bash
 bash setup/install.sh check
 bash setup/install.sh configure --port 8788 --provider live
-export AI_PLATFORM_API_KEY="your-api-key"
 bash setup/install.sh start
 ```
 
-Open [http://127.0.0.1:8788](http://127.0.0.1:8788). For an offline demo, use `--provider sim` when configuring the server.
+Open [http://127.0.0.1:8788](http://127.0.0.1:8788). In **LLM Providers**, enter a provider's API key, enable and save it, then select it as the default before creating a project. For an offline demo, use `--provider sim` when configuring the server.
 
 To install missing optional tools, inspect the plan and then run it:
 
@@ -70,6 +75,22 @@ set +a
 node server.mjs
 ```
 
+### Provider settings
+
+The **LLM Providers** page configures OpenAI-compatible and Anthropic connections. Settings are saved in `data/settings.json` with file permissions `600`. Saved provider changes apply to the next model call without a server restart.
+
+Model selection uses the project's stage-specific provider/model first, then an enabled saved default provider with a key. If neither is available, the environment fallback requires both `AI_PLATFORM_API_KEY` (or a supported fallback key) and `AI_PLATFORM_BASE_URL`. For example:
+
+```bash
+export AI_PLATFORM_PROVIDER=live
+export AI_PLATFORM_API_KEY="your-api-key"
+export AI_PLATFORM_BASE_URL="https://api.deepseek.com/v1"
+export AI_PLATFORM_MODEL="deepseek-v4-flash"
+bash setup/install.sh start
+```
+
+`data/`, `workspace/`, `setup/ai-platform.env`, and `setup/run/` remain local and are excluded from Git. Pointing an existing checkout at the private repository preserves these local files; a fresh clone does not include them.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -78,8 +99,9 @@ node server.mjs
 | `AI_PLATFORM_PORT` | `8788` | HTTP port |
 | `AI_PLATFORM_PROVIDER` | `live` | `live` for model calls; `sim` for offline templates |
 | `AI_PLATFORM_API_KEY` | None | API key for the configured model endpoint |
-| `AI_PLATFORM_BASE_URL` | `https://api.deepseek.com/v1` | OpenAI-compatible API base URL |
-| `AI_PLATFORM_MODEL` | `deepseek-v4-flash` | Default model; a project can override it per stage |
+| `AI_PLATFORM_BASE_URL` | Unset | OpenAI-compatible API base URL; required for the environment fallback |
+| `AI_PLATFORM_MODEL` | `deepseek-v4-flash` | Environment fallback model; saved provider settings take priority |
+| `AI_PLATFORM_SETTINGS_FILE` | `data/settings.json` | Saved provider configuration and API keys |
 | `AI_PLATFORM_DATA` | `data/projects.json` | Project state file |
 | `AI_PLATFORM_WORKSPACE` | `workspace/` | Generated files directory |
 | `AI_PLATFORM_CONCURRENCY` | `3` | Concurrent development slots, from `1` to `8`; `1` enables serial review |
@@ -90,7 +112,7 @@ node server.mjs
 | `AI_PLATFORM_INSTALL_CMD` | Unset | Custom toolchain installation command, executed through `sh -c` |
 | `CHROME_PATH` | Default macOS Chrome path | Browser executable for UI checks and screenshots |
 
-API key lookup in `agent.mjs`: `AI_PLATFORM_API_KEY`, then `DEEPSEEK_API_KEY`, then `OPENAI_API_KEY`, then a DeepSeek or platform key in `~/.hermes/.env`. Changing the endpoint, default model, or key requires restarting the server.
+Environment fallback key lookup in `agent.mjs`: `AI_PLATFORM_API_KEY`, then `DEEPSEEK_API_KEY`, then `OPENAI_API_KEY`, then a supported API key in `~/.hermes/.env`. Environment changes require a server restart. Provider settings changed in the dashboard do not.
 
 ## Start, inspect, and stop
 
@@ -133,11 +155,11 @@ Verification runs unit tests, offline HTTP end-to-end tests, and browser UI chec
 
 | Problem | Action |
 |---|---|
-| Live generation reports a missing API key | Export `AI_PLATFORM_API_KEY`, or save it with `configure --api-key`. Use `sim` for an offline demo. |
+| Live generation reports a missing API key | Configure and enable a provider in **LLM Providers**. For the environment fallback, set both the key and Base URL. Use `sim` for an offline demo. |
 | Java or Python tests cannot run | Check the required runtime with `check`; use `install` or install it manually. Java discovery verifies `javac -version`. |
 | Browser checks report `SKIP` | Install Chrome or set `CHROME_PATH` to its executable. |
 | Port is already in use | Stop the instance using it or configure another port. |
 | Server reports an existing instance | Stop the server holding the state-file lock, or use a different `AI_PLATFORM_DATA` path. |
-| A model setting has no effect | Restart after changing environment variables. Project stage-model changes apply to the next call. |
+| A model setting has no effect | Check the stage override and saved default provider. Dashboard changes apply to the next call; environment changes require a restart. |
 | Server fails to start | Inspect `setup/run/ai-platform-<port>.log` and run `check` again. |
 | Project needs a fresh run | Use **Rebuild** in the dashboard. It clears generated deliverables and history while preserving project skills and input materials. |

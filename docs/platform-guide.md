@@ -82,18 +82,22 @@ Java module tests compile that module's own files. Integration checks compile th
 
 ### Model configuration
 
-The platform calls an OpenAI-compatible `/chat/completions` endpoint. Configure the endpoint, key, and default model through environment variables; see the [setup guide](../setup/README.md#configuration).
+Configure connections in **LLM Providers**. Presets include OpenAI, Claude, DeepSeek, and MiniMax. Enter the API key, enable and save the provider, then select a default. OpenAI-compatible providers use `/chat/completions`; Anthropic providers use `/v1/messages`. Settings are stored locally in `data/settings.json` and are excluded from Git.
 
-To override a stage's model, use the model selector in **Workflow & Gates** or send:
+Selection priority is the project's stage-specific provider/model, then an enabled saved default provider with a key, then the environment fallback. The environment fallback requires both a key and `AI_PLATFORM_BASE_URL`; see the [setup guide](../setup/README.md#provider-settings).
+
+To override a stage's model, use the model selector in **Pipeline & Gates** or send:
 
 ```http
 POST /api/projects/:id/models
 Content-Type: application/json
 
-{"models":{"wbs":"deepseek-reasoner"}}
+{"models":{"wbs":"deepseek/deepseek-reasoner"}}
 ```
 
 An empty model value removes that stage's override. A change applies to the next model call. Offline mode uses `sim.mjs` templates instead of calling the model endpoint.
+
+The interface supports Japanese and English, with Japanese as the default. Preset skills and generated templates use Japanese or English. Model prompts request Japanese prose and allow English technical terms and code identifiers.
 
 ### Project skills
 
@@ -171,6 +175,12 @@ All routes below are handled by `server.mjs`. Request and response bodies use JS
 |---|---|---|
 | GET | `/api/state` | State, workflows, types, model channel, and runtime settings |
 | GET | `/api/stream` | Server-sent progress events |
+| GET | `/api/settings` | Read provider settings with masked API keys |
+| GET | `/api/settings/enabled-models` | List enabled provider/model choices with configured keys |
+| PUT | `/api/settings/providers/:id` | Save provider configuration |
+| POST | `/api/settings/providers/:id/test` | Test a configured provider connection |
+| POST | `/api/settings/providers/:id/clear` | Clear a provider's key and disable it |
+| POST | `/api/settings/default` | Select the default provider |
 | POST | `/api/projects` | Create a project |
 | GET / PUT / DELETE | `/api/projects/:id` | Read, update, or delete a project |
 | POST | `/api/projects/:id/activate` | Select the active project |

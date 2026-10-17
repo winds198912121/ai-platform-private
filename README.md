@@ -6,7 +6,7 @@ Coordinate specialized AI agents while people guide the work, review outputs, an
 
 ![DevFlow AI Software Delivery Team: human oversight, AI agents, and deliverables across the software delivery lifecycle](docs/assets/devflow-ai-delivery-team.png)
 
-[Download the HTML overview](https://github.com/winds198912121/ai-platform/raw/refs/heads/main/docs/DevFlow_AI_Delivery_Team_EN_v2.html) · [View the full-size image](docs/assets/devflow-ai-delivery-team.png)
+[HTML overview](docs/DevFlow_AI_Delivery_Team_EN_v2.html) · [View the full-size image](docs/assets/devflow-ai-delivery-team.png)
 
 Turn a project brief into requirements, designs, a development plan, code, tests, and an operations runbook. Follow progress in a web dashboard and review each step before the workflow continues.
 
@@ -30,7 +30,7 @@ flowchart LR
     Flow --> AI["AI Generation<br/>agent.mjs / sim.mjs"]
     Flow --> Run["Code and Test Runner<br/>exec.mjs"]
     Skills["Project Skills<br/>Engineering rules"] --> AI
-    AI <-->|"Live mode"| LLM["Model API<br/>OpenAI-compatible"]
+    AI <-->|"Live mode"| LLM["Model API<br/>OpenAI-compatible / Anthropic"]
     Flow --> State[("Project State<br/>data/projects.json")]
     Run --> Workspace[("Generated Files<br/>workspace/")]
 ```
@@ -62,21 +62,34 @@ The supported display languages are Japanese and English; Japanese is the defaul
 
 Requires **Node.js 20 or later**. Use **Node.js 22 or later** for browser checks and screenshots.
 
+This is the private development repository. Continue using your existing local checkout; a new clone is only needed when setting up another working copy. Changing the Git remote leaves local configuration, project data, and generated workspaces in place. These files are excluded from Git.
+
+For a new working copy, use a GitHub account with access to this private repository:
+
 ```bash
-git clone https://github.com/winds198912121/ai-platform.git
+git clone https://github.com/winds198912121/ai-platform-private.git ai-platform
 cd ai-platform
 ```
 
 ### Run with a model
 
 ```bash
+AI_PLATFORM_PROVIDER=live node server.mjs
+```
+
+Open [http://127.0.0.1:8788](http://127.0.0.1:8788) and configure **LLM Providers** before creating a project: enter the provider's API key, enable and save it, then select it as the default provider. The presets include OpenAI, Claude, DeepSeek, and MiniMax. Provider settings are saved locally in `data/settings.json` and are excluded from Git.
+
+Stage-specific provider/model selections take priority over the saved default provider. If neither is available, an environment-only configuration can supply an OpenAI-compatible endpoint. Set both the key and Base URL; for example:
+
+```bash
+export AI_PLATFORM_PROVIDER=live
 export AI_PLATFORM_API_KEY="your-api-key"
+export AI_PLATFORM_BASE_URL="https://api.deepseek.com/v1"
+export AI_PLATFORM_MODEL="deepseek-v4-flash"
 node server.mjs
 ```
 
-Open [http://127.0.0.1:8788](http://127.0.0.1:8788), create a project, and review the deliverables as each stage completes.
-
-The default provider is DeepSeek (`deepseek-v4-flash`). To use another OpenAI-compatible endpoint, also set `AI_PLATFORM_BASE_URL` and `AI_PLATFORM_MODEL`. Live execution requires a valid API key.
+Create a project and review the deliverables as each stage completes.
 
 ### Try the offline demo
 
