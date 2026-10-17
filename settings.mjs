@@ -86,7 +86,7 @@ function save() {
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(out, null, 2));
     try { fs.chmodSync(SETTINGS_FILE, 0o600); } catch { /* 非 POSIX/不支持就忽略 */ }
   } catch (e) {
-    console.error('[settings] 保存失败：', e.message);
+    console.error('[settings] 保存に失敗：', e.message);
     throw e;
   }
 }

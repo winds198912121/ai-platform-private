@@ -363,7 +363,7 @@ try {
   ok(sm.unit_tests.exit_code === 0 && sm.unit_tests.failed === 0 && sm.unit_tests.passed > 0,
     `node --test 真跑通过：PASS=${sm.unit_tests.passed} FAIL=${sm.unit_tests.failed} 退出码=${sm.unit_tests.exit_code}`);
 } catch (e) {
-  fail++; console.log(`  FAIL  异常：${e.message}`);
+  fail++; console.log(`  FAIL  異常：${e.message}`);
 }
 
 console.log(`\nRESULT: ${fail === 0 ? 'PASS' : 'FAIL'}  (PASS=${pass} FAIL=${fail})`);

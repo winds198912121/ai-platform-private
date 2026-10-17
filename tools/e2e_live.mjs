@@ -27,7 +27,7 @@ const waitFor = async (fn, ms = 420000, what = '') => {
   const t0 = Date.now(); let lastLog = t0;
   while (Date.now() - t0 < ms) {
     const v = await fn(); if (v) return v;
-    if (Date.now() - lastLog > 45000) { lastLog = Date.now(); console.log(`    … 仍在等待「${what}」已 ${Math.round((Date.now() - t0) / 1000)}s`); }
+    if (Date.now() - lastLog > 45000) { lastLog = Date.now(); console.log(`    … 待機中「${what}」経過 ${Math.round((Date.now() - t0) / 1000)}s`); }
     await sleep(1500);
   }
   throw new Error(`等待超时：${what}（${ms / 1000}s 内未完成）`);
@@ -124,7 +124,7 @@ try {
     ok(m.artifacts[0].content.includes(m.dir), '模块产物记录了代码位置');
     ok(/^src\/[a-z][a-z0-9_-]*\/m\d+-/.test(m.dir), `模块目录来自架构规约：${m.dir}（层 ${m.layer}）`);
     const stray = m.files.filter(f => !(f.path.startsWith(m.dir + '/') || f.path === m.test_path));
-    console.log(`  落位：${m.files.map(f => f.path).join('、')}${stray.length ? `  ⚠ ${stray.length} 个文件不在规约目录内` : ''}`);
+    console.log(`  落位：${m.files.map(f => f.path).join('、')}${stray.length ? `  ⚠ 規定ディレクトリ外 ${stray.length} 件` : ''}`);
     const ws = (await get(`/api/projects/${pid}/workspace`)).body;
     ok(ws.files.length >= 2 && fs.existsSync(path.join(WORKSPACE, pid, ws.files[0].path)), '工作区文件在磁盘上真实存在');
     const ap = await post(`/api/projects/${pid}/modules/${m.id}/approve`, { reviewer: 'PM' });
@@ -132,7 +132,7 @@ try {
     else ok(ap.status === 409, `单测未过（退出码 ${m.unit_tests.exit_code}）→ 门禁 409 拦住批准：${ap.body.error}`);
   }
 } catch (e) {
-  fail++; console.log(`  FAIL  异常：${e.message}`);
+  fail++; console.log(`  FAIL  異常：${e.message}`);
 }
 
 console.log(`\n耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);

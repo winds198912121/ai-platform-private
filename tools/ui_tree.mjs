@@ -40,7 +40,7 @@ process.on('exit', cleanup);
 process.on('SIGINT', () => process.exit(130));
 
 if (!fs.existsSync(CHROME)) {
-  console.log('SKIP  未找到 Google Chrome，跳过 UI 检查（http://127.0.0.1:9225 手动起也行）');
+  console.log('SKIP  Google Chrome が見つからず、UI 検査をスキップ（http://127.0.0.1:9225 で手動起動も可）');
   process.exit(0);
 }
 
@@ -852,7 +852,7 @@ const freshPane = await ev(`(() => {
 })()`);
 ok(freshPane.html === '' && freshPane.midText === '' && !freshPane.pre,
   `新建项目内容区留空（innerHTML ${freshPane.html.length} 字、无 pre）`);
-ok(/还没有产出源码/.test(freshPane.left), `空态说明只放在左列表：${freshPane.left}`);
+ok(/まだソースが出力されていません/.test(freshPane.left), `空状態の説明は左リストにのみ表示：${freshPane.left}`);
 await shot('56-source-fresh-blank.png');
 
 console.log('\n[8.19] 流程点：等分撑满界面宽度 + 每个流程点中间一个图标');
