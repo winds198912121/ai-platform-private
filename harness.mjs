@@ -7,6 +7,8 @@
      4. WBS stage的交付物 = module清单；开发stage逐moduleexecute：
         真实生成代码 → real-ran node --test → 必须 FAIL=0 且Human批准，
         才能进入/一modules；全部module批准后开发stage闭合，进入結合テスト。
+     5. ゲート方針(governance.mjs)：human_gate では自動承認・API 直叩きの承認を拒否、
+        auto でも human_gates(既定：要件・アーキ)は人の承認必須。モジュールは依存(deps)が承認済みになるまで着手しない。
    证据来源：所有测试数字都来自 exec.mjs 真实execute，不是编出来的。
    ============================================================ */
 import fs from 'node:fs';
@@ -15,6 +17,9 @@ import { fileURLToPath } from 'node:url';
 import * as sim from './sim.mjs';
 import * as agent from './agent.mjs';
 import * as exec from './exec.mjs';
+import * as G from './governance.mjs';
+import * as PX from './prototype.mjs';
+import * as capture from './capture.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(DIR, 'data');
@@ -99,7 +104,7 @@ export const TYPES = [
     techs: ['Next.js + NestJS + PostgreSQL', 'Java 21 + Spring Boot 3.3 + PostgreSQL 16', 'Vue 3 + Express + SQLite'],
     layers: ['core', 'domain', 'service', 'api', 'ui'],
     skills: ['development-general-conventions', 'dev-code-layout', 'security-baseline', 'env-bootstrap',
-      'dev-nodejs', 'dev-java-springboot', 'architecture-layering-contracts', 'testing-coverage-matrix',
+      'dev-nestjs-nextjs-postgres', 'dev-nodejs', 'dev-java-springboot', 'architecture-layering-contracts', 'testing-coverage-matrix',
       'agx-code-review-and-quality', 'agx-test-driven-development'] },
   { id: 'website', name: 'Website / Static', workflow: 'website', hint: 'Content site: build UI and pages, no Operations',
     techs: ['HTML5 + CSS3 + vanilla JavaScript (ES Modules) static site', 'React + Vite static site', 'SAP CAP Node.js (content + OData service)'],
@@ -128,14 +133,14 @@ export const TYPES = [
     techs: ['Next.js + NestJS + PostgreSQL', 'Java 21 + Spring Boot 3.3 + PostgreSQL 16', 'Node.js 22 + Fastify + SQLite'],
     layers: ['core', 'domain', 'service', 'api', 'ui'],
     skills: [
-      // BMAD method core (8 skills)
-      'bmad-brainstorming', 'bmad-brief', 'bmad-ux', 'bmad-architecture',
-      'bmad-build', 'bmad-code-review', 'bmad-qa-generate-e2e-tests', 'bmad-retrospective',
+      // BMAD v6 primary workflows (one per stage; replaces the 8 legacy bmad-* presets — see governance.STAGE_SKILL_PLAN)
+      'bmad6-requirements', 'bmad6-ux', 'bmad6-architecture', 'bmad6-planning',
+      'bmad6-dev-story', 'bmad6-tea-testing', 'bmad6-retrospective',
       // existing platform skills (per-stage)
       'requirements-interview-and-conflict', 'requirements-ids-and-acceptance',
       'ux-information-architecture',
       'architecture-layering-contracts',
-      'development-general-conventions', 'dev-nodejs', 'dev-java-springboot',
+      'development-general-conventions', 'dev-nestjs-nextjs-postgres', 'dev-nodejs', 'dev-java-springboot',
       'testing-coverage-matrix',
       'deployment-release-and-rollback',
       'operations-monitoring-runbook',
@@ -265,6 +270,11 @@ export const get = (id) => db.projects.find(p => p.id === id);
 export function must(id) { const p = get(id); if (!p) throw new HttpError(404, `Project not found: ${id}`); return p; }
 export function currentStage(p) { return p.stages.find(s => s.status !== 'approved') || null; }
 const lastFeedback = (x) => {
+  const fb = baseFeedback(x);
+  if (!x.feedback) return fb;                     // 疑問への回答（影響分析で戻されたとき）は差し戻し・テスト結果と一緒に渡す
+  return fb ? { category: `${x.feedback.category} + ${fb.category}`, comment: `${x.feedback.comment}\n${fb.comment}` } : x.feedback;
+};
+const baseFeedback = (x) => {
   if (x.review && x.review.decision === 'rejected') return { category: x.review.category, comment: x.review.comment };
   // 自动retry：把上一轮**真实测试输出**喂回去，模型才知道哪断言挂了(否则只会盲目重生成)
   const u = x.unit_tests;
@@ -333,6 +343,7 @@ export function createProject(input = {}) {
     brief: (input.brief || '').trim(),
     tech: (input.tech || '').trim(),
     mode: input.mode === 'auto' ? 'auto' : 'human_gate',
+    human_gates: sanitizeGates(input.human_gates),  // auto モードでも人の承認が必須な段階(既定：要件・アーキ)
     workflow: wf.id,
     provider: channelInfo().channel,
     created_at: now(), updated_at: now(),
@@ -360,6 +371,13 @@ export function createProject(input = {}) {
   return p;
 }
 
+/** human_gates の入力を段階 ID の配列に正規化(未指定 = 既定の高リスク段階)。 */
+function sanitizeGates(v) {
+  if (v === undefined || v === null) return [...G.HIGH_RISK_STAGES];
+  const list = Array.isArray(v) ? v : String(v).split(/[\s,]+/);
+  return [...new Set(list.map(String).filter(id => STAGES.some(s => s.id === id)))];
+}
+
 /** 老数据没 has inputs 字段——读到就补上。 */
 export const inputsOf = (p) => (p.inputs ||= []);
 
@@ -383,7 +401,7 @@ export function activate(id) { if (!get(id)) throw new HttpError(404, 'Project n
 /* ---------- project信息：建完还能改(name / 需求 / Tech stack / Entry mode；Software type与Workflow不在这儿改) ---------- */
 
 const PROJ_MAX = { name: 80, tech: 200, brief: 20000 };
-const PROJ_FIELD = { type: 'Software type', workflow: 'Workflow', name: 'Project name', tech: 'Tech stack', brief: 'Requirements', mode: 'Entry mode' };
+const PROJ_FIELD = { type: 'Software type', workflow: 'Workflow', name: 'Project name', tech: 'Tech stack', brief: 'Requirements', mode: 'Entry mode', human_gates: 'Human-required gates' };
 
 /** 一个全新的stagerecords。 */
 const freshStage = (sid) => {
@@ -418,11 +436,14 @@ export function updateProject(p, input = {}) {
     tech: String(input.tech ?? p.tech ?? '').trim().slice(0, PROJ_MAX.tech),
     brief: String(input.brief ?? p.brief ?? '').trim().slice(0, PROJ_MAX.brief),
     mode: input.mode === undefined ? p.mode : (input.mode === 'auto' ? 'auto' : 'human_gate'),
+    human_gates: input.human_gates === undefined ? G.humanGatesOf(p) : sanitizeGates(input.human_gates),
   };
   if (!next.name) throw new HttpError(400, 'Project name cannot be empty');
   const retarget = next.type !== base.type || next.workflow !== base.workflow;
   if (retarget && (p.stages || []).some(s => s.status === 'running')) throw new HttpError(409, 'a stage is running: wait for it to finish before changing software type / workflow');
-  const changed = Object.keys(PROJ_FIELD).filter(k => (p[k] || '') !== (next[k] || ''));
+  const changed = Object.keys(PROJ_FIELD).filter(k => k === 'human_gates'
+    ? G.humanGatesOf(p).join(',') !== next.human_gates.join(',')
+    : (p[k] || '') !== (next[k] || ''));
   if (!changed.length) return p;                                                  // 没改动就别记事件
   const beforeName = p.name, beforeType = base.type, beforeWf = workflowOf(p);
   let note = '';
@@ -435,7 +456,7 @@ export function updateProject(p, input = {}) {
       + `${m.added.length ? `、added ${m.added.map(id => STAGES.find(s => s.id === id).name).join('、')}` : ''}`
       + `${m.gone.length ? `、removed ${m.gone.map(id => STAGES.find(s => s.id === id).name).join('、')}(artifact records removed; workspace files retained)` : ''})`;
   }
-  p.name = next.name; p.tech = next.tech; p.brief = next.brief; p.mode = next.mode;
+  p.name = next.name; p.tech = next.tech; p.brief = next.brief; p.mode = next.mode; p.human_gates = next.human_gates;
   p.updated_at = now();
   pushEvent(p, { stage: 'project', kind: 'info', text: `Project info edited (${changed.map(k => PROJ_FIELD[k]).join('、')}): `
     + (changed.includes('name') ? `${beforeName} → ${p.name}` : p.name)
@@ -457,7 +478,8 @@ const cleanSkill = (s = {}) => {
   if (!body) throw new HttpError(400, 'Skill body cannot be empty (state what to do / what is forbidden)');
   const raw = String(s.stage ?? '').trim();
   const stage = raw && STAGES.some(x => x.id === raw) ? raw : '';    // empty = all stages; unknown id treated as empty (don't error)
-  return { name, body, stage };
+  const role = G.ROLES.includes(s.role) ? s.role : '';               // primary / checklist / project(empty = derived, see G.roleOf)
+  return { name, body, stage, role };
 };
 
 const stageName = (id) => (STAGES.find(s => s.id === id) || {}).name || 'all stages';
@@ -465,9 +487,11 @@ const stageName = (id) => (STAGES.find(s => s.id === id) || {}).name || 'all sta
 export function addSkill(p, input = {}, { silent = false } = {}) {
   const list = skillsOf(p);
   if (list.length >= SKILL_LIMIT.count) throw new HttpError(400, `Max ${SKILL_LIMIT.count} skills`);
-  const { name, body, stage } = cleanSkill(input);
+  const { name, body, stage, role } = cleanSkill(input);
   const n = list.reduce((mx, s) => Math.max(mx, Number(String(s.id).replace(/\D/g, '')) || 0), 0) + 1;
   const skill = { id: `SK-${n}`, name, body, stage, added_at: now(), by: String(input.editor || 'Human').slice(0, 40) };
+  if (role) skill.role = role;
+  if (input.preset) { skill.preset = String(input.preset).slice(0, 80); if (input.desc) skill.desc = String(input.desc).slice(0, 400); }
   list.push(skill);
   if (!silent) pushEvent(p, { stage: 'project', kind: 'artifact', text: `new skill ${skill.id}"${skill.name}"· applies to: ${stageName(stage)} · sent with every model call (total: ${list.length} skills)` });
   save();
@@ -477,8 +501,9 @@ export function addSkill(p, input = {}, { silent = false } = {}) {
 export function updateSkill(p, sid, input = {}) {
   const skill = skillsOf(p).find(s => s.id === sid);
   if (!skill) throw new HttpError(404, `Skill not found: ${sid}`);
-  const { name, body, stage } = cleanSkill({ name: input.name ?? skill.name, body: input.body ?? skill.body, stage: input.stage ?? skill.stage });
+  const { name, body, stage, role } = cleanSkill({ name: input.name ?? skill.name, body: input.body ?? skill.body, stage: input.stage ?? skill.stage, role: input.role ?? skill.role });
   skill.name = name; skill.body = body; skill.stage = stage;
+  if (role) skill.role = role; else delete skill.role;
   pushEvent(p, { stage: 'project', kind: 'artifact', text: `Skill ${sid}"${skill.name}"updated · applies to: ${stageName(stage)}` });
   save();
   return skill;
@@ -667,7 +692,7 @@ export function importSkills(p, ids) {
   for (const c of want) {
     if (has.has(`${c.name}|${c.stage}`)) { skipped++; continue; }
     if (skillsOf(p).length >= SKILL_LIMIT.count) { dropped++; continue; }    // 到顶了也别把整批import搞挂
-    addSkill(p, { name: c.name, body: c.body, stage: c.stage, editor: `Preset ${c.id}` }, { silent: true });
+    addSkill(p, { name: c.name, body: c.body, stage: c.stage, editor: `Preset ${c.id}`, preset: c.id, desc: c.desc, role: G.planRole(c.id) || '' }, { silent: true });
     has.add(`${c.name}|${c.stage}`);
     added++;
   }
@@ -676,6 +701,99 @@ export function importSkills(p, ids) {
   }
   return { added, skipped, dropped, total: skillsOf(p).length };
 }
+/* ---------- 段階別スキル割当(§11)：主軸ワークフロー / チェックリスト / 案件専用 ---------- */
+
+// 言語別規約は「人が指定したスタック」優先(アーキが依存なし Node に置き換えても、それに合わせて dev-nodejs を勧めない)
+const planOf = (p) => G.skillPlanFor(p.stages.map(s => s.id), String(p.tech || '').trim() || stackOf(p));
+
+/** 割当の適用状況：段階ごとに 3 区分の各スキルが取り込み済みか、外すべきものが残っていないか。 */
+export function skillPlanStatus(p) {
+  const plan = planOf(p);
+  const cat = new Map(skillCatalog().map(c => [c.id, c]));
+  const mine = skillsOf(p);
+  const byPreset = new Map(mine.map(s => [G.presetIdOf(s), s]).filter(([k]) => k));
+  const out = {};
+  for (const [sid, e] of Object.entries(plan)) {
+    const row = (id, role) => ({ id, role, name: cat.get(id)?.name || id, applied: byPreset.has(id), available: cat.has(id) });
+    const own = mine.filter(s => (s.stage || '') === sid && G.roleOf(s) === 'project').map(s => ({ id: s.id, name: s.name }));
+    out[sid] = {
+      primary: e.primary.map(id => row(id, 'primary')),
+      checklist: e.checklist.map(id => row(id, 'checklist')),
+      project: { suggested: e.project, have: own },
+      conflicts: e.exclude.filter(id => byPreset.has(id)).map(id => ({ id, skill: byPreset.get(id).id, name: byPreset.get(id).name })),
+    };
+  }
+  return out;
+}
+
+/**
+ * 割当を適用：主軸・チェックリストを取り込み(役割付き)、外す対象のプリセット由来スキルを削除。
+ * 人が書いたスキル(案件専用)には触らない。dryRun なら変更せずに差分だけ返す。
+ */
+export function applySkillPlan(p, { dryRun = false } = {}) {
+  const plan = planOf(p);
+  const cat = new Map(skillCatalog().map(c => [c.id, c]));
+  const want = new Map();                                     // presetId → { stage, role }
+  for (const [sid, e] of Object.entries(plan)) {
+    for (const id of e.primary) want.set(id, { stage: sid, role: 'primary' });
+    for (const id of e.checklist) if (!want.has(id)) want.set(id, { stage: sid, role: 'checklist' });
+  }
+  const exclude = new Set(Object.values(plan).flatMap(e => e.exclude).filter(id => !want.has(id)));
+  const mine = skillsOf(p);
+  const remove = mine.filter(s => exclude.has(G.presetIdOf(s)));
+  const have = new Set(mine.map(G.presetIdOf).filter(Boolean));
+  const add = [...want.entries()].filter(([id]) => !have.has(id) && cat.has(id));
+  const missing = [...want.keys()].filter(id => !cat.has(id));
+  const retag = mine.filter(s => want.has(G.presetIdOf(s)) && s.role !== want.get(G.presetIdOf(s)).role);
+  const diff = { add: add.map(([id, w]) => ({ id, ...w })), remove: remove.map(s => ({ id: s.id, preset: G.presetIdOf(s), name: s.name })), retag: retag.map(s => s.id), missing };
+  if (dryRun) return diff;
+  if (mine.length - remove.length + add.length > SKILL_LIMIT.count) throw new HttpError(400, `Applying the plan would exceed ${SKILL_LIMIT.count} skills — delete some project skills first`);
+  for (const s of remove) mine.splice(mine.indexOf(s), 1);
+  for (const s of retag) s.role = want.get(G.presetIdOf(s)).role;
+  for (const [id, w] of add) {
+    const c = cat.get(id);
+    addSkill(p, { name: c.name, body: c.body, stage: w.stage, role: w.role, editor: `Preset ${id}`, preset: id, desc: c.desc }, { silent: true });
+  }
+  pushEvent(p, { stage: 'project', kind: 'artifact', text: `stage skill plan applied (BMAD primary + checklists): +${add.length} imported, −${remove.length} conflicting removed${remove.length ? ` (${remove.map(s => s.name).join('、')})` : ''}${missing.length ? ` · ${missing.length} preset(s) not available: ${missing.join(', ')}` : ''} · total ${mine.length} skills` });
+  save();
+  return { ...diff, total: mine.length };
+}
+
+/** トレーサビリティ：台帳カバレッジ + 依存 DAG + ゲート方針(画面表示用にまとめて返す)。 */
+export function trace(p) {
+  const cv = G.coverage(p);
+  return {
+    ledger: { total: cv.total, planned: cv.planned, implemented: cv.implemented, uncovered: cv.uncovered, unknown: cv.unknown, byKind: cv.byKind, scanned: p.ledger?.scanned || null, generated_at: p.ledger?.generated_at || null },
+    rows: cv.rows.map(r => ({ id: r.id, kind: r.kind, name: r.name, parent: r.parent, refs: r.refs, source: (r.sources || [])[0] || null, origin: r.origin, modules: r.modules, status: r.status })),
+    dag: { order: G.dagOrder(p.modules), modules: p.modules.map(m => ({ id: m.id, name: m.name, layer: m.layer, deps: m.deps || [], blocked_by: G.blockedBy(p, m).map(x => x.id), req_ids: m.req_ids || [], status: m.status })) },
+    gates: { mode: p.mode, human: G.humanGatesOf(p), stages: p.stages.map(s => ({ id: s.id, human: G.needsHuman(p, s.kind === 'development' ? 'development' : s.id) })) },
+    stack: stackDeviation(p),
+    questions: { open: G.questionsOf(p).filter(q => q.status === 'open').length, answered: G.questionsOf(p).filter(q => q.status === 'answered').length,
+      on_hold: (p.modules || []).filter(m => m.status === 'on_hold').map(m => m.id) },
+    lessons: { draft: G.lessonsOf(p).filter(l => l.status === 'draft').length },
+  };
+}
+
+/** 宣言スタック(アーキ) と実行器のずれ：例「Next.js + NestJS + PostgreSQL」宣言なのに実行は依存なし Node ESM。 */
+export function stackDeviation(p) {
+  const requested = String(p.tech || '').trim();          // 人が指定したスタック
+  const resolved = stackOf(p);                            // アーキ(ARC-01)が採用したスタック
+  const pr = prof(p);
+  const runner = pr.label || pr.id;
+  const needsDeps = (x) => /nest|next|express|fastify|spring|postgres|mysql|react|vue|prisma|typeorm/i.test(x);
+  const declared = needsDeps(requested) ? requested : resolved;
+  const replaced = requested && resolved && requested !== resolved && needsDeps(requested) && !needsDeps(resolved);
+  if (!needsDeps(declared)) return { declared, resolved, runner, deviates: false };
+  if (pr.deps && !replaced) return { declared, resolved, runner, deviates: false, deps: true };   // TS 档案：npm 許可リストで実際に依存を入れて走らせる
+  return { declared, resolved, runner, deviates: true, replaced,
+    note: replaced
+      ? `Requested stack "${requested}" was replaced by "${resolved}" in architecture, because the executor only runs ${runner} without dependencies.`
+      : `Declared stack "${declared}" needs frameworks/DB, but the executor runs ${runner} without dependencies — generated code cannot use them.` };
+}
+
+/** /api/state 用：各プロジェクトに計算済みの統制情報を付ける(永続化しない)。 */
+export const withGovernance = (p) => ({ ...p, governance: { trace: trace(p), skill_plan: skillPlanStatus(p) } });
+
 export function removeProject(id, { force = false } = {}) {
   const p = get(id);
   if (p) {
@@ -714,9 +832,12 @@ export function rebuildProject(id, { force = false } = {}) {
   };
   for (const s of p.stages)
     Object.assign(s, { status: 'pending', attempts: 0, artifacts: [], review: null, error: null, started_at: null, finished_at: null, progress: 0, progress_label: 'started' });
+  for (const s of p.stages) delete s.human_hold;
   p.wbs = { epics: [], task_count: 0 };
+  delete p.ledger;                     // 要件台帳は要件段階の再実行で入力資料から作り直す
   p.arch = typeArch(typeOf(p.type), p.tech);   // 架构规约回到分类自带的那套，重跑架构stage再定
   p.modules = [];
+  if (p.questions) p.questions = p.questions.filter(q => q.status !== 'open');   // 未回答はモジュールと一緒に消える（再生成で再質問）。回答済みは決定事項として残す
   p.events = [];                       // 历史痕迹清零(紧接着写/重建这一)
   try { stat.dirs = exec.clearWorkspace(id); } catch (e) { stat.dirs = [`(清理failed: ${e.message})`]; }
   save();
@@ -754,18 +875,31 @@ export function kick(p, opts = {}) {
     const slots = CONC - p.modules.filter(m => m.status === 'running').length;
     for (let i = 0; i < slots; i++) {
       // 只领取"没做过"或"人reject"'s module；failedretrymax 3 轮，避免模型反复failed时无限循环
-      const next = p.modules.find(m => m.status === 'pending' || m.status === 'rejected' || (m.status === 'failed' && (m.attempts || 0) < 3));
+      // 依存(deps)が全部承認済みのものだけ着手：上位が mock 相手に先走らない(DAG 順)
+      // 未回答の疑問に紐づくもの（on_hold / 担当 ID が重なる）は回答まで着手しない：曖昧な仕様の上に作らない
+      const next = p.modules.find(m => (m.status === 'pending' || m.status === 'rejected' || (m.status === 'failed' && (m.attempts || 0) < 3)) && !G.blockedBy(p, m).length && !G.heldBy(p, m).length);
       if (!next) break;
       runModule(p, next, opts).catch(e => console.error('[harness]', e.message));
     }
     // 已done's module在人(或 auto 模式)批准后才把槽位还回来
     const rev = p.modules.filter(m => m.status === 'awaiting_review');
-    if (rev.length && p.mode === 'auto') rev.forEach(m => later(`${p.id}:${m.id}`, 700, () => approveModule(p, m.id, 'AI auto-approve')));
+    if (rev.length && !G.needsHuman(p, 'development')) rev.forEach(m => later(`${p.id}:${m.id}`, 700, () => approveModule(p, m.id, 'AI auto-approve', { source: 'auto' })));
     return;
   }
 
   if (st.status === 'awaiting_review') {
-    if (p.mode === 'auto') later(`${p.id}:${st.id}`, 700, () => approveStage(p, st.id, 'AI auto-approve'));
+    const gaps = st.id === 'wbs' ? wbsGaps(p) : [];
+    if (!G.needsHuman(p, st.id) && !gaps.length) later(`${p.id}:${st.id}`, 700, () => approveStage(p, st.id, 'AI auto-approve', { source: 'auto' }));
+    else if (gaps.length && !st.human_hold) {           // 網羅漏れのある WBS は auto でも人に回す
+      st.human_hold = true;
+      pushEvent(p, { stage: st.id, kind: 'gate', text: `⏸ ${st.name}: ${gaps.length} ledger ID(s) uncovered — human review required` });
+      save();
+    }
+    else if (p.mode === 'auto' && !st.human_hold) {      // auto モードでも高リスク段階はここで止まる(一度だけ記録)
+      st.human_hold = true;
+      pushEvent(p, { stage: st.id, kind: 'gate', text: `⏸ ${st.name}: high-risk gate — human approval required even in auto mode (human_gates: ${G.humanGatesOf(p).join(', ')})` });
+      save();
+    }
     return;
   }
   if (st.status === 'pending' || st.status === 'rejected' || st.status === 'failed') {
@@ -804,8 +938,7 @@ export async function runStage(p, stageId, opts = {}) {
     try {
       const r = PROVIDER === 'sim' ? sim.planWbs(p) : await agent.wbs(p);
       if (!p._removed && st.attempts > 0) {
-        p.wbs = { epics: r.epics, task_count: r.task_count, generated_at: r.generated_at || now(), model: r.model || null };
-        p.modules = planModules(p, p.wbs, archLayers(p));
+        storeWbs(p, r);
         save();
         pushEvent(p, { stage: st.id, kind: 'artifact', text: `DevFlow auto-WBS: ${p.modules.length} module(s) generated from architecture (${p.wbs.task_count} tasks across ${p.wbs.epics.length} epics)` });
       }
@@ -843,11 +976,18 @@ export async function runStage(p, stageId, opts = {}) {
       pushEvent(p, { stage: st.id, kind: 'step', text: PROVIDER === 'sim' ? 'offline channel · generating WBS' : ` calling ${modelFor(p, 'wbs')}  to decompose tasks…` });
       const r = PROVIDER === 'sim' ? sim.planWbs(p) : await agent.wbs(p);
       if (stale()) return;
-      p.wbs = { epics: r.epics, task_count: r.task_count, generated_at: r.generated_at || now(), model: r.model || null };
-      p.modules = planModules(p, p.wbs, archLayers(p));
+      storeWbs(p, r);
       setProg(85, 'planned');
+      const cv = G.coverage(p), dagFrom = p.wbs.epics[0]?.deps_from;
+      pushEvent(p, { stage: st.id, kind: 'step', text: `dependency graph: ${p.modules.filter(m => m.deps.length).length}/${p.modules.length} module(s) have deps (${dagFrom === 'wbs' ? 'declared by WBS' : 'inferred from layer order'}); DAG order ${G.dagOrder(p.modules).join(' → ')}` });
+      if (cv.total) pushEvent(p, { stage: st.id, kind: cv.uncovered.length ? 'error' : 'step', text: `traceability: ${cv.planned}/${cv.total} ledger ID(s) assigned to modules${cv.uncovered.length ? ` · ${cv.uncovered.length} uncovered: ${cv.uncovered.slice(0, 20).join(', ')}${cv.uncovered.length > 20 ? ' …' : ''}` : ''}` });
       pushEvent(p, { stage: st.id, kind: 'artifact', text: `decomposed into ${p.wbs.epics.length} Epics / ${p.wbs.task_count} Tasks → generated ${p.modules.length} dev module(s) (per architecture, assigned to ${archLayers(p).join(' / ')}  layer(s); language: ${prof(p).label})` });
     } else {
+      if (st.id === 'requirements') {
+        setProg(25, 'building requirements ledger');
+        await buildLedger(p, st);
+        if (stale()) return;
+      }
       setProg(35, 'generating artifacts');
       const r = PROVIDER === 'sim'
         ? { artifacts: sim.planArtifacts(p, st).map(a => ({ ...a, status: 'generated', version: st.attempts })) }
@@ -858,10 +998,22 @@ export async function runStage(p, stageId, opts = {}) {
           });
       if (stale()) return;
       st.artifacts = r.artifacts.map(a => ({ ...a, status: 'generated', version: st.attempts, at: now() }));
+      if (st.id === 'requirements' && G.ledgerItems(p).length)
+        st.artifacts.unshift({ id: 'REQ-00', name: '要件台帳', type: 'markdown', content: G.ledgerMarkdown(p), status: 'generated', version: st.attempts, at: now() });
+      if (st.id === 'ux') {
+        setProg(80, 'generating prototypes');
+        await buildPrototypes(p, st, stale);
+        if (stale()) return;
+      }
       const docs = writeDocs(p, st);
       if (r.model) pushEvent(p, { stage: st.id, kind: 'step', text: `Model ${r.model} returned, tokens: ${r.usage?.total_tokens ?? '—'}` });
-      pushEvent(p, { stage: st.id, kind: 'artifact', text: `produced ${st.artifacts.length} artifact(s): ${st.artifacts.map(a => a.name).join('、')}${docs ? `(written to workspace/${p.id}/docs/)` : ''}` });
-      if (st.id === 'architecture') p.arch = readLayout(p, st);
+      const docArts = st.artifacts.filter(a => !a.group), screens = st.artifacts.filter(a => a.group === 'screens' && a.type === 'html');
+      pushEvent(p, { stage: st.id, kind: 'artifact', text: `produced ${st.artifacts.length} artifact(s): ${docArts.map(a => a.name).join('、')}${screens.length ? ` + ${screens.length} screen prototype(s)` : ''}${docs ? `(written to workspace/${p.id}/docs/)` : ''}` });
+      if (st.id === 'architecture') {
+        p.arch = readLayout(p, st);
+        const dv = stackDeviation(p);           // 宣言スタックと実行器のずれはアーキのゲートで見えるようにする
+        if (dv.deviates) pushEvent(p, { stage: st.id, kind: 'error', text: `⚠ stack deviation: ${dv.note}` });
+      }
     }
 
     // 真实execute证据：测试 / 部署stage跑的是工作区里真实存在的代码
@@ -882,6 +1034,113 @@ export async function runStage(p, stageId, opts = {}) {
   }
   save();
   kick(p, opts);
+}
+
+/**
+ * 要件台帳：入力資料を「全文」走査して ID を決定的に抽出(LLM 不使用)→ ID の無い FR/NFR だけモデルで補完。
+ * 入力が無い/ID が無い小規模案件は概要文から FR を立てる(オフラインでも同じ)。
+ */
+async function buildLedger(p, st) {
+  const files = G.readInputs(p, exec.wsDir(p.id));
+  const { items, scanned } = G.scanLedger(files, Array.isArray(p.ledger_patterns) && p.ledger_patterns.length ? p.ledger_patterns : undefined);
+  let extra = [];
+  if (PROVIDER !== 'sim') {
+    try { extra = (await agent.ledgerSupplement(p, items)).items; }
+    catch (e) { pushEvent(p, { stage: st.id, kind: 'error', text: `ledger supplement (FR/NFR) skipped: ${e.message}` }); }
+  }
+  if (!items.length && !extra.length) {
+    extra = String(p.brief || p.name).split(/[。．.!\n]+/).map(x => x.trim()).filter(x => x.length > 3).slice(0, 8)
+      .map((name, i) => ({ id: `FR-${String(i + 1).padStart(3, '0')}`, kind: 'requirement', name: name.slice(0, 40), parent: null, refs: 0, sources: [], origin: 'brief' }));
+  }
+  p.ledger = { items: [...items, ...extra], scanned, generated_at: now() };
+  const by = {};
+  for (const it of p.ledger.items) by[it.kind] = (by[it.kind] || 0) + 1;
+  pushEvent(p, { stage: st.id, kind: 'artifact', text: `requirements ledger: scanned ${scanned.files} input file(s) in full (${Math.round(scanned.bytes / 1024)}KB) → ${p.ledger.items.length} ID(s) (${Object.entries(by).map(([k, n]) => `${k} ${n}`).join(' / ')}); ${extra.length} added by ${PROVIDER === 'sim' || !items.length ? 'brief' : 'model'}` });
+  save();
+}
+
+/**
+ * UX 段階の見える成果物：台帳の画面・帳票 ID ごとに HTML プロトタイプ（共通テンプレート 1 本 + 画面ごとの中身）を
+ * workspace/<pid>/prototypes/ に書き、ブラウザがあれば PNG を撮る（無ければ skipped のイベントだけ）。
+ * 成果物：UX-DS（デザインシステム, html）・UXP-<ID>（画面, html）・UXS-<ID>（撮影, image）。本文は DB に持たずファイルを指す。
+ */
+async function buildPrototypes(p, st, stale = () => false) {
+  const screens = PX.screensOf(p);
+  if (!screens.length) {
+    pushEvent(p, { stage: st.id, kind: 'step', text: 'prototypes: no screen/report IDs in the requirements ledger → HTML prototypes skipped' });
+    return;
+  }
+  const root = exec.wsDir(p.id);
+  const at = now(), version = st.attempts;
+  let ds;
+  try { ds = PROVIDER === 'sim' ? sim.uxDesign(p) : await agent.uxDesign(p); }
+  catch (e) { ds = sim.uxDesign(p); pushEvent(p, { stage: st.id, kind: 'error', text: `design system: model call failed (${e.message}) → default tokens` }); }
+  if (stale()) return;
+  const template = PX.designSystem(ds.tokens, ds.system);
+  const files = [{ path: `${PX.DIR}/_template.html`, content: template }, { path: PX.TEMPLATE_FILE, content: PX.templatePreview(template) }];
+  const arts = [{ id: 'UX-DS', name: 'デザインシステム（共通テンプレート）', type: 'html', path: PX.TEMPLATE_FILE, status: 'generated', version, at }];
+  const imp = PX.importantOf(p, screens);
+  let hiOk = 0, fromAsIs = 0;
+  for (const scr of screens) {
+    const asis = PX.asIsOf(p, root, scr.id);
+    if (asis.title && (!scr.name || /[IＩ][DＤ]$/.test(scr.name))) scr.name = asis.title;   // 台帳名が定型（「画面ＩＤ」等）なら現行資料の見出しを使う
+    const base = { ...PX.specFromAsIs(scr, asis), source: asis.file || '', fkeys: ds.fkeys };
+    if (base.from === 'as-is') fromAsIs++;
+    let spec = base;
+    if (scr.important) {
+      try { spec = { ...base, ...(PROVIDER === 'sim' ? sim.uxHifi(p, scr, base) : await agent.uxScreen(p, scr, asis, base)) }; hiOk++; }
+      catch (e) { spec = { ...base, ...sim.uxHifi(p, scr, base) }; pushEvent(p, { stage: st.id, kind: 'error', text: `hi-fi ${scr.id}: model call failed (${e.message}) → template content` }); }
+      if (stale()) return;
+    }
+    const fidelity = scr.important ? 'high' : 'low';
+    files.push({ path: PX.fileOf(scr.id), content: PX.renderScreen(template, scr, spec, { fidelity }) });
+    arts.push({ id: `UXP-${scr.id}`, name: `${scr.id} ${scr.name || (scr.form === 'report' ? '帳票' : '画面')}`, type: 'html', path: PX.fileOf(scr.id), group: 'screens',
+      screen: scr.id, form: scr.form, fidelity, important: !!scr.important, spec_from: base.from, asis: asis.found ? { file: asis.file, line: asis.line } : null, status: 'generated', version, at });
+  }
+  exec.writeFiles(root, files);
+  pushEvent(p, { stage: st.id, kind: 'artifact', text: `prototypes: design-system template ×1 + ${screens.length} screen(s) (1:1 with ledger IDs) → workspace/${p.id}/${PX.DIR}/ · hi-fi ${screens.filter(s => s.important).length}${imp.auto ? ' (auto-picked by refs; mark important screens to choose)' : ''} · fields from AS-IS docs ${fromAsIs}/${screens.length}` });
+
+  const max = Number(process.env.AI_PLATFORM_SHOT_MAX || 400);
+  const jobs = [{ id: 'UX-DS', html: path.join(root, PX.TEMPLATE_FILE), png: path.join(root, PX.shotOf('_design-system')) },
+    ...screens.slice(0, max).map(s => ({ id: `UXP-${s.id}`, html: path.join(root, PX.fileOf(s.id)), png: path.join(root, PX.shotOf(s.id)) }))];
+  const shot = await capture.capture(jobs);
+  if (stale()) return;
+  if (shot.skipped) pushEvent(p, { stage: st.id, kind: 'step', text: `screenshots skipped: ${shot.skipped} (HTML prototypes are still viewable)` });
+  else {
+    const ok = new Set(shot.shots);
+    for (const j of jobs) {
+      if (!ok.has(j.png)) continue;
+      const rel = path.relative(root, j.png).split(path.sep).join('/');
+      const a = arts.find(x => x.id === j.id);
+      a.shot = rel;
+      if (a.group) arts.push({ id: `UXS-${a.screen}`, name: `${a.screen} 撮影`, type: 'image', path: rel, group: 'screens', of: a.id, screen: a.screen, status: 'generated', version, at });
+    }
+    pushEvent(p, { stage: st.id, kind: 'artifact', text: `screenshots: ${shot.shots.length}/${jobs.length} PNG captured in ${(shot.ms / 1000).toFixed(1)}s (${path.basename(shot.browser || '')})${jobs.length < screens.length + 1 ? ` · capped at AI_PLATFORM_SHOT_MAX=${max}` : ''}${shot.errors.length ? ` · ${shot.errors.length} failed: ${shot.errors.slice(0, 3).map(e => e.error).join('; ')}` : ''}` });
+  }
+  st.artifacts.push(...arts.map(a => ({ ...a })));
+}
+
+/** 重要画面（ハイファイ対象）の指定：次回 UX 実行で反映。 */
+export function markImportant(p, screenId, on = true) {
+  const known = PX.screensOf(p).map(s => s.id);
+  if (!known.includes(screenId)) throw new HttpError(404, `Screen not in ledger: ${screenId}`);
+  const cur = Array.isArray(p.ux_important) ? p.ux_important : PX.importantOf(p, PX.screensOf({ ...p, ux_important: undefined })).ids;
+  p.ux_important = on ? [...new Set([...cur, screenId])] : cur.filter(id => id !== screenId);
+  pushEvent(p, { stage: 'ux', kind: 'info', text: `${on ? '★ marked' : '☆ unmarked'} ${screenId} as an important screen (hi-fi on next UX run) · ${p.ux_important.length} important` });
+  save();
+  return { ux_important: p.ux_important };
+}
+
+/** AS-IS（現行資料）の抜粋：UX ゲートの比較表示用。 */
+export function asIs(p, screenId) {
+  if (!/^[\w.-]{2,40}$/.test(screenId)) throw new HttpError(400, 'screen id required');
+  return PX.asIsOf(p, exec.wsDir(p.id), screenId);
+}
+
+/** WBS ゲートで止める理由：台帳の ID がどのモジュールにも割り当てられていない。 */
+export function wbsGaps(p) {
+  if (!G.ledgerItems(p).length || !p.modules.length) return [];
+  return G.coverage(p).uncovered;
 }
 
 /** 测试/部署stage：真的在工作区跑一遍代码与用例。 */
@@ -915,7 +1174,9 @@ async function runRealEvidence(p, st, d) {
   }
   await d(200);
   const tr = await exec.runWorkspaceTests(root);            // 工作区里有什么语言就真跑什么
-  lines.push(`real-ran \`${tr.cmd}\`(ワークスペース) → PASS=${tr.passed} FAIL=${tr.failed} 終了コード=${tr.exit_code} ${tr.ms}ms`);
+  execNotes(p, st.id, tr);
+  lines.push(`real-ran \`${tr.cmd}\`(ワークスペース) → PASS=${tr.passed} FAIL=${tr.failed}${tr.skipped ? ` SKIPPED=${tr.skipped}` : ''} 終了コード=${tr.exit_code} ${tr.ms}ms`);
+  if (tr.db && tr.db.status === 'skipped') lines.push(`PostgreSQL 統合テスト：未実行（${tr.db.why}）— 合格扱いにしない`);
   st.artifacts.push({
     id: st.id === 'testing' ? 'TST-02' : 'DPL-03',
     name: st.id === 'testing' ? '結合テストレポート（実行結果）' : 'スモークテストレポート（実行結果）',
@@ -931,13 +1192,14 @@ PASS=${tr.passed} FAIL=${tr.failed} TESTS=${tr.total}
 | tests | ${tr.total} |
 | pass | ${tr.passed} |
 | fail | ${tr.failed} |
-
+${tr.skipped ? `| skipped（未実行・合格扱いにしない） | ${tr.skipped} |\n` : ''}${tr.db ? `| PostgreSQL | ${tr.db.status}${tr.db.why ? `：${tr.db.why}` : ''} |\n` : ''}
 \`\`\`
 ${tr.tail}
 \`\`\`
 `,
   });
   if (tr.failed > 0) throw new Error(`real tests failed: FAIL=${tr.failed} (see integration test report)`);
+  if (tr.install && !tr.install.ok) throw new Error(`dependency install failed — tests did not run: ${String(tr.install.why || '').slice(0, 200)}`);
   return lines;
 }
 const generated = (st) => (st.review?.decision === 'approved' ? 'approved' : 'generated');
@@ -961,12 +1223,23 @@ function writeArtifactFile(p, ownerId, artifact) {
 }
 
 function writeDocs(p, st) {
-  return st.artifacts.map(a => writeArtifactFile(p, st.id, a)).filter(Boolean).length;
+  return st.artifacts.filter(a => !a.type || a.type === 'markdown').map(a => writeArtifactFile(p, st.id, a)).filter(Boolean).length;
 }
 
 /* ---------- Humaneditartifact / 工作区文件 ---------- */
 
-const unitTestsOf = (tr) => ({ total: tr.total, passed: tr.passed, failed: tr.failed, exit_code: tr.exit_code, cmd: tr.cmd, ms: tr.ms, at: tr.at, timed_out: !!tr.timed_out, tail: tr.tail });
+const unitTestsOf = (tr) => ({ total: tr.total, passed: tr.passed, failed: tr.failed, exit_code: tr.exit_code, cmd: tr.cmd, ms: tr.ms, at: tr.at, timed_out: !!tr.timed_out, tail: tr.tail,
+  ...(tr.skipped ? { skipped: tr.skipped } : {}), ...(tr.db ? { db: tr.db } : {}) });
+
+/** 依存インストールと PostgreSQL の実行状況をイベントに出す：skip は「通過」ではないと明記する。 */
+function execNotes(p, stage, tr) {
+  const i = tr.install;
+  if (i && i.ok && !i.cached) pushEvent(p, { stage, kind: 'step', text: `npm install (${i.mode || 'online'}) done in ${i.ms}ms${i.added && i.added.length ? ` · added ${i.added.join(', ')}` : ''}` });
+  if (i && !i.ok) pushEvent(p, { stage, kind: 'error', text: `✕ dependency install failed: ${String(i.why || '').slice(0, 300)}` });
+  if (tr.db && tr.db.status === 'skipped')
+    pushEvent(p, { stage, kind: 'step', text: `⚠ PostgreSQL integration tests SKIPPED — not counted as passed: ${tr.db.why}${tr.skipped ? ` (${tr.skipped} test(s) skipped)` : ''}` });
+  else if (tr.db) pushEvent(p, { stage, kind: 'step', text: `PostgreSQL for integration tests: ${tr.db.status}${tr.db.container ? ` (${tr.db.image} · ${tr.db.container})` : ''}` });
+}
 
 function buildModuleReport(p, mod, tr, cdsChk) {
   return {
@@ -1030,6 +1303,7 @@ export function editArtifact(p, aid, { content, editor = 'Human' } = {}) {
   if (typeof content !== 'string') throw new HttpError(400, 'content must be a string');
   assertEditable(hit.owner);
   const a = hit.artifact;
+  if (a.type && a.type !== 'markdown') throw new HttpError(409, `"${a.name}" is a ${a.type} file artifact: edit workspace/${p.id}/${a.path} in the Workspace tab instead`);
   if (a.content === content) return a;
   a.content = content;
   a.version = (a.version || 1) + 1;
@@ -1059,6 +1333,7 @@ export async function editWorkspaceFile(p, relPath, content, { editor = 'Human' 
     const testRel = mod.test_path || (mod.files.find(f => !f.path.startsWith((mod.dir || '') + '/')) || {}).path;
     if (testRel) {
       const tr = await exec.runTests(root, testRel, prof(p), [...mod.files.map(f => f.path), rel]);   // ← 改过代码就必须真跑(只编本module + 刚改的文件)
+      execNotes(p, 'development', tr);
       mod.unit_tests = unitTestsOf(tr);
       mod.files = exec.listFiles(root)
         .filter(f => belongsToModule(p, mod, f, testRel))
@@ -1090,8 +1365,12 @@ export function checkModuleRunnable(p, moduleId) {
   if (mod.status === 'approved') throw new HttpError(409, 'Module already approved');
   if (mod.status === 'awaiting_review') throw new HttpError(409, 'Module awaiting review — approve or reject first');
   if (mod.status === 'running') throw new HttpError(409, 'Module is being developed');
+  const held = G.heldBy(p, mod);
+  if (held.length) throw new HttpError(409, `Module ${mod.id} is on hold: open question(s) ${held.map(q => q.id).join(', ')} must be answered first`);
   const st = p.stages.find(s => s.id === 'development');
   guardAdvance(p, st);
+  const wait = G.blockedBy(p, mod);
+  if (wait.length) throw new HttpError(409, `Module ${mod.id} depends on unapproved module(s): ${wait.map(m => `${m.id} "${m.name}"`).join(', ')}`);
   // 串行模式(并发=1)才要求前序module先批准；并行模式/发令顺序由 Agent 池决定
   if (CONC === 1) {
     const idx = p.modules.indexOf(mod);
@@ -1126,6 +1405,11 @@ export async function runModule(p, mod, opts = {}) {
     if (!testRel) throw new Error(`invalid test path from model: ${code.test.path}`);
     mod.files = exec.writeFiles(root, [...code.files, code.test]);
     if (!mod.files.length) throw new Error('model produced no writeable files');
+    if (prof(p).deps) {                                          // 依存ありの栈：要求された依存を許可リストで篩って package.json に追記（版は平台固定）
+      const pk = exec.ensurePackageJson(root, { stack: stackOf(p), deps: code.deps });
+      if (pk.added.length) pushEvent(p, { stage: 'development', kind: 'step', text: `package.json: added ${pk.added.join(', ')} (versions pinned by platform allowlist)` });
+      if (pk.rejected.length) pushEvent(p, { stage: 'development', kind: 'error', text: `⚠ ${mod.id} requested dependencies outside the allowlist (not installed): ${pk.rejected.join(', ')}` });
+    }
     setProg(70, 'files written');
     if (code.usage) pushEvent(p, { stage: 'development', kind: 'step', text: `Model returned, token usage ${code.usage.total_tokens ?? '—'}` });
     pushEvent(p, { stage: 'development', kind: 'artifact', text: `wrote ${mod.files.length}  file(s): ${mod.files.map(f => f.path).join('、')}` });
@@ -1143,37 +1427,48 @@ export async function runModule(p, mod, opts = {}) {
       .filter(x => p.modules.some(m => m !== mod && (m.files || []).some(f => f.path === x.path)));
     if (dup.length) pushEvent(p, { stage: 'development', kind: 'error', text: `⚠ ${mod.id}  file clashes with another module (same-layer overwrite — use a more specific name): ${dup.map(x => x.path).join('、')}` });
 
-    await d(200);
-    setProg(85, 'running tests');
-    const tr = await exec.runTests(root, testRel, prof(p), mod.files.map(f => f.path));   // ← 真实execute(按栈选run器；Java 只编本module，别的层同名类不该拖垮它)
-    mod.unit_tests = unitTestsOf(tr);
-    mod.summary = code.summary || mod.summary || '';
-    mod.test_path = testRel;
-    const cdsChk = prof(p).cds ? exec.checkCds(root) : null;
-    mod.artifacts = [buildModuleReport(p, mod, tr, cdsChk)];
-    pushEvent(p, { stage: 'development', kind: 'test', text: `real-ran ${tr.cmd} → PASS=${tr.passed} FAIL=${tr.failed}，exit code ${tr.exit_code}` });
-    if (cdsChk) {
-      pushEvent(p, { stage: 'development', kind: 'step', text: cdsChk.files
-        ? `CDS 構造検証：${cdsChk.files} CDS files ${cdsChk.ok ? '構造正常' : 'Issues: ' + cdsChk.errors.map(e => `${e.file}：${e.error}`).join('；')}`
-        : 'CDS 構造検証：No CDS files were produced by this module; CAP data/service layers should include db/schema.cds and srv/*.cds' });
-    }
-    if (tr.ok === false && tr.exit_code === -1 && /missing JDK|missing python3|JDK not found|python3 not found/i.test(tr.tail)) throw new Error(`module ${mod.id} could not run tests: ${tr.tail.split('\n')[0]}`);
-    const pass = tr.exit_code === 0 && tr.failed === 0 && tr.total > 0;
-    if (pass) {
-      const broken = await reverifyApprovedModules(p, mod);      // 本module可能重写了同层文件 → 复核别人还成不成立
-      mod.status = 'awaiting_review';
-      mod.progress = 100; mod.progress_label = 'awaiting review';
-      pushEvent(p, { stage: 'development', kind: 'gate', text: `⏸ module ${mod.id}"${mod.name}"done → awaiting manual approval (unit tests FAIL=0: PASS=${tr.passed})${broken.length ? `· same-layer audit found ${broken.length} module(s) sent back: ${broken.join('、')}` : ''}` });
+    // 仕様が曖昧なら推測で作らず疑問を返す（§6 疑問・変更台帳）：草稿ファイルは残し、テストは回答後の再実行で
+    const qs = G.cleanQuestions(p, code.questions, mod);
+    if (qs.length) {
+      const added = raiseQuestions(p, mod, qs, mod.agent || 'Dev-Agent');
+      mod.summary = code.summary || mod.summary || '';
+      mod.status = 'on_hold'; mod.progress = 100; mod.progress_label = 'on hold';
+      pushEvent(p, { stage: 'development', kind: 'gate', text: `⏸ module ${mod.id}"${mod.name}" on hold: ${added.length} open question(s) ${added.map(q => `${q.id} [${q.req_ids.join(', ') || '—'}]`).join('、')} → answer them in Traceability to resume` });
     } else {
-      // 门禁不通过 = modulefailed(不是"等人批准"): 这样 kick() 才会重排retry，并把真实failed输出喂回模型
-      const bad = (tr.tail || '').split('\n').filter(l => /^✖ /.test(l)).map(l => l.replace(/^✖ /, '').replace(/\s*\(\d[\d.]*ms\)\s*$/, '').trim()).slice(0, 3);
-      const more = (mod.attempts || 0) < 3 ? `→ Automatic retry (attempt ${(mod.attempts || 0) + 1}/3 attempts)` : '→ Three attempts failed. Inspect the actual output or reject the module to retry.';
-      mod.status = 'failed';
-      mod.error = (tr.timed_out
-        ? `単体テストtimeout(${tr.ms}ms: test process did not exit; check open handles, timers, or pending promises)`
-        : `単体テスト failed: PASS=${tr.passed} FAIL=${tr.failed}(exit code ${tr.exit_code})`)
-        + (bad.length ? `· failed cases: ${bad.join('；')}` : '');
-      pushEvent(p, { stage: 'development', kind: 'error', text: `✕ module ${mod.id}"${mod.name}"${mod.error} ${more}` });
+
+      await d(200);
+      setProg(85, 'running tests');
+      const tr = await exec.runTests(root, testRel, prof(p), mod.files.map(f => f.path));   // ← 真实execute(按栈选run器；Java 只编本module，别的层同名类不该拖垮它)
+      execNotes(p, 'development', tr);
+      mod.unit_tests = unitTestsOf(tr);
+      mod.summary = code.summary || mod.summary || '';
+      mod.test_path = testRel;
+      const cdsChk = prof(p).cds ? exec.checkCds(root) : null;
+      mod.artifacts = [buildModuleReport(p, mod, tr, cdsChk)];
+      pushEvent(p, { stage: 'development', kind: 'test', text: `real-ran ${tr.cmd} → PASS=${tr.passed} FAIL=${tr.failed}，exit code ${tr.exit_code}` });
+      if (cdsChk) {
+        pushEvent(p, { stage: 'development', kind: 'step', text: cdsChk.files
+          ? `CDS 構造検証：${cdsChk.files} CDS files ${cdsChk.ok ? '構造正常' : 'Issues: ' + cdsChk.errors.map(e => `${e.file}：${e.error}`).join('；')}`
+          : 'CDS 構造検証：No CDS files were produced by this module; CAP data/service layers should include db/schema.cds and srv/*.cds' });
+      }
+      if (tr.ok === false && tr.exit_code === -1 && /missing JDK|missing python3|JDK not found|python3 not found|npm missing|npm install failed|outside the allowlist|tsx not installed/i.test(tr.tail)) throw new Error(`module ${mod.id} could not run tests: ${tr.tail.split('\n')[0]}`);
+      const pass = tr.exit_code === 0 && tr.failed === 0 && tr.total > 0;
+      if (pass) {
+        const broken = await reverifyApprovedModules(p, mod);      // 本module可能重写了同层文件 → 复核别人还成不成立
+        mod.status = 'awaiting_review';
+        mod.progress = 100; mod.progress_label = 'awaiting review';
+        pushEvent(p, { stage: 'development', kind: 'gate', text: `⏸ module ${mod.id}"${mod.name}"done → awaiting manual approval (unit tests FAIL=0: PASS=${tr.passed})${broken.length ? `· same-layer audit found ${broken.length} module(s) sent back: ${broken.join('、')}` : ''}` });
+      } else {
+        // 门禁不通过 = modulefailed(不是"等人批准"): 这样 kick() 才会重排retry，并把真实failed输出喂回模型
+        const bad = (tr.tail || '').split('\n').filter(l => /^✖ /.test(l)).map(l => l.replace(/^✖ /, '').replace(/\s*\(\d[\d.]*ms\)\s*$/, '').trim()).slice(0, 3);
+        const more = (mod.attempts || 0) < 3 ? `→ Automatic retry (attempt ${(mod.attempts || 0) + 1}/3 attempts)` : '→ Three attempts failed. Inspect the actual output or reject the module to retry.';
+        mod.status = 'failed';
+        mod.error = (tr.timed_out
+          ? `単体テストtimeout(${tr.ms}ms: test process did not exit; check open handles, timers, or pending promises)`
+          : `単体テスト failed: PASS=${tr.passed} FAIL=${tr.failed}(exit code ${tr.exit_code})`)
+          + (bad.length ? `· failed cases: ${bad.join('；')}` : '');
+        pushEvent(p, { stage: 'development', kind: 'error', text: `✕ module ${mod.id}"${mod.name}"${mod.error} ${more}` });
+      }
     }
   } catch (e) {
     const msg = e.message || String(e);
@@ -1181,6 +1476,11 @@ export async function runModule(p, mod, opts = {}) {
       mod.status = 'failed'; mod.error = msg;
       pushEvent(p, { stage: 'development', kind: 'error', text: `✕ module ${mod.id}"${mod.name}"failed: ${mod.error}` });
     }
+  }
+  if (mod.requeue) {                       // 実行中に関係する疑問が回答された：この結果は古い前提なので作り直す
+    delete mod.requeue;
+    mod.status = G.heldBy(p, mod).some(q => q.module === mod.id) ? 'on_hold' : 'pending';
+    pushEvent(p, { stage: 'development', kind: 'gate', text: `↻ module ${mod.id}"${mod.name}" re-queued: a related question was answered while it was running` });
   }
   syncDevelopment(p);
   save();
@@ -1201,7 +1501,7 @@ function syncDevelopment(p) {
     }
   } else if (mods.some(m => m.status === 'failed')) st.status = 'failed';
   else if (mods.some(m => m.status === 'running')) st.status = 'running';
-  else if (mods.some(m => m.status === 'awaiting_review')) st.status = 'awaiting_review';
+  else if (mods.some(m => m.status === 'awaiting_review' || m.status === 'on_hold')) st.status = 'awaiting_review';   // 人の判断待ち（承認 or 疑問への回答）
   else st.status = 'running';
 }
 
@@ -1227,13 +1527,18 @@ export async function reverifyApprovedModules(p, changed, opts = {}) {
 
 /* ---------- 审核(核心门禁) ---------- */
 
-export function approveStage(p, stageId, reviewer = 'Human') {
+export function approveStage(p, stageId, reviewer = 'Human', { source = 'direct', ackGaps = false } = {}) {
   const st = p.stages.find(s => s.id === stageId);
   if (!st) throw new HttpError(404, 'Stage not found');
   if (st.kind === 'development') throw new HttpError(409, 'Development stage approves per module — cannot approve whole stage');
   if (st.status !== 'awaiting_review') throw new HttpError(409, `current status is "${st.status}" — cannot approve`);
-  st.status = 'approved'; st.finished_at = now();
-  st.review = { decision: 'approved', by: reviewer, at: now() };
+  const bad = G.approvalViolation(p, st.id, reviewer, source);
+  if (bad) { pushEvent(p, { stage: st.id, kind: 'error', text: `✕ ${st.name}: ${bad}` }); save(); throw new HttpError(403, bad); }
+  const gaps = st.id === 'wbs' ? wbsGaps(p) : [];
+  if (gaps.length && !ackGaps) throw new HttpError(409, `${gaps.length} requirements-ledger ID(s) are not assigned to any module: ${gaps.slice(0, 15).join(', ')}${gaps.length > 15 ? ' …' : ''}. Reject to re-plan, or approve with ack_gaps to accept the gaps.`);
+  if (gaps.length) pushEvent(p, { stage: st.id, kind: 'gate', text: `⚠ ${st.name} approved with ${gaps.length} uncovered ledger ID(s) acknowledged by ${reviewer}` });
+  st.status = 'approved'; st.finished_at = now(); delete st.human_hold;
+  st.review = { decision: 'approved', by: reviewer, at: now(), source };
   st.artifacts.forEach(a => { a.status = 'approved'; });
   pushEvent(p, { stage: st.id, kind: 'gate', text: `✓ ${st.name} " approved (${reviewer}) → release next stage` });
   save(); kick(p); return st;
@@ -1244,18 +1549,21 @@ export function rejectStage(p, stageId, { category = 'Uncategorized', comment = 
   if (!st) throw new HttpError(404, 'Stage not found');
   if (st.kind === 'development') throw new HttpError(409, 'Development stage rejects per module');
   if (st.status !== 'awaiting_review') throw new HttpError(409, `current status is "${st.status}" — cannot reject`);
-  st.status = 'rejected';
+  st.status = 'rejected'; delete st.human_hold;
   st.review = { decision: 'rejected', by: reviewer, at: now(), category, comment };
   pushEvent(p, { stage: st.id, kind: 'gate', text: `✕ ${st.name} rejected [${category}]${comment ? '：' + comment : ''} → feedback fed to model, retrying` });
+  if (String(comment).trim()) draftLesson(p, { from: 'rejection', ref: st.id, stage: st.id, draft: G.lessonDraft({ kind: 'rejection', category, comment, stage: st.id }) });
   save();
   guarded(p.id, () => runStage(p, st.id));
   return st;
 }
 
-export function approveModule(p, moduleId, reviewer = 'Human') {
+export function approveModule(p, moduleId, reviewer = 'Human', { source = 'direct' } = {}) {
   const mod = p.modules.find(m => m.id === moduleId);
   if (!mod) throw new HttpError(404, 'Module not found');
   if (mod.status !== 'awaiting_review') throw new HttpError(409, `module current status is "${mod.status}" — cannot approve`);
+  const bad = G.approvalViolation(p, 'development', reviewer, source);
+  if (bad) { pushEvent(p, { stage: 'development', kind: 'error', text: `✕ module ${mod.id}: ${bad}` }); save(); throw new HttpError(403, bad); }
   if (!mod.unit_tests) throw new HttpError(409, 'missing unit-test record — cannot approve');
   if (mod.unit_tests.exit_code !== 0 || mod.unit_tests.failed > 0) {
     const u = mod.unit_tests;
@@ -1266,14 +1574,16 @@ export function approveModule(p, moduleId, reviewer = 'Human') {
     throw new HttpError(409, `unit tests failed (${why}，exit code ${u.exit_code}) — cannot approve`);
   }
   if (mod.unit_tests.total <= 0) throw new HttpError(409, 'unit tests produced no cases (total=0) — cannot approve');
+  const wait = G.blockedBy(p, mod);
+  if (wait.length) throw new HttpError(409, `cannot approve ${mod.id} before its dependencies: ${wait.map(m => `${m.id} "${m.name}"`).join(', ')}`);
   if (CONC === 1) {                              // 串行模式才要求前序module先批准
     const idx = p.modules.indexOf(mod);
     const prev = p.modules.slice(0, idx).find(m => m.status !== 'approved');
     if (prev) throw new HttpError(409, `Predecessor module "${prev.name}" not approved`);
   }
 
-  mod.status = 'approved';
-  mod.review = { decision: 'approved', by: reviewer, at: now() };
+  mod.status = 'approved'; delete mod.feedback;
+  mod.review = { decision: 'approved', by: reviewer, at: now(), source };
   mod.artifacts.forEach(a => { a.status = 'approved'; });
   pushEvent(p, { stage: 'development', kind: 'gate', text: `✓ ${mod.agent || 'Dev-Agent'} 's module ${mod.id}"${mod.name}"" approved (${reviewer})· ${mod.unit_tests.cmd} PASS=${mod.unit_tests.passed}` });
   syncDevelopment(p);
@@ -1288,10 +1598,117 @@ export function rejectModule(p, moduleId, { category = 'Uncategorized', comment 
   mod.status = 'rejected'; mod.version += 1; mod.attempts = wasApproved ? 0 : mod.attempts;   // 人给的机会不计入自动retry的 3 轮
   mod.review = { decision: 'rejected', by: reviewer, at: now(), category, comment };
   pushEvent(p, { stage: 'development', kind: 'gate', text: `✕ module ${mod.id}"${mod.name}"${wasApproved ? '(approved → retracted)' : ''}rejected [${category}]${comment ? '：' + comment : ''} → feedback fed to model, retrying` });
+  if (String(comment).trim()) draftLesson(p, { from: 'rejection', ref: mod.id, stage: 'development', draft: G.lessonDraft({ kind: 'rejection', category, comment, module: mod.id, name: mod.name }) });
   syncDevelopment(p);
   save();
   kick(p);                  // reject即重做，并由 kick 把其余并发槽位也补上
   return mod;
+}
+
+/* ---------- 疑問・変更台帳（§6）+ 教訓ループ（§10-7） ---------- */
+
+const nextId = (list, prefix) => `${prefix}-${list.reduce((mx, x) => Math.max(mx, Number(String(x.id).replace(/\D/g, '')) || 0), 0) + 1}`;
+
+/** 開発エージェントの疑問を台帳に登録（同じモジュール・同じ文面の未回答は重複登録しない）。 */
+function raiseQuestions(p, mod, qs, by) {
+  const list = (p.questions ||= []);
+  const added = [];
+  for (const q of qs) {
+    const dup = list.find(x => x.status === 'open' && x.module === mod.id && x.text === q.text);
+    if (dup) { added.push(dup); continue; }
+    const item = { id: nextId(list, 'Q'), module: mod.id, req_ids: q.req_ids, text: q.text, status: 'open', asked_by: String(by).slice(0, 40), asked_at: now() };
+    list.push(item); added.push(item);
+  }
+  return added;
+}
+
+/** 回答は人の判断：API 直叩き・自動化名義は拒否（ゲート方針と同じ基準）。 */
+function humanOnly(p, what, by, source) {
+  const why = source === 'api' ? `${what} must come from the dashboard (requests without x-approval-source: dashboard are treated as automated)`
+    : source === 'auto' ? `${what} cannot be automated`
+    : !String(by || '').trim() ? `${what} needs a named person`
+    : G.looksAutomated(by) ? `${what}: "${by}" looks automated` : null;
+  if (why) { pushEvent(p, { stage: 'development', kind: 'error', text: `✕ ${why}` }); save(); throw new HttpError(403, why); }
+}
+
+/**
+ * 疑問に回答 → 影響分析：req_ids が重なるモジュール + 質問元 + それらに依存するモジュールだけを pending に戻し、
+ * 回答をフィードバックとして渡す（無関係なモジュールは触らない）。回答は教訓の下書きにもなる。
+ */
+export function answerQuestion(p, qid, { answer = '', by = 'Human', source = 'direct' } = {}) {
+  const q = G.questionsOf(p).find(x => x.id === qid);
+  if (!q) throw new HttpError(404, `Question not found: ${qid}`);
+  if (q.status !== 'open') throw new HttpError(409, `Question ${qid} is already ${q.status}`);
+  const text = String(answer || '').trim().slice(0, 4000);
+  if (!text) throw new HttpError(400, 'Answer cannot be empty');
+  humanOnly(p, `Answer to ${qid}`, by, source);
+  q.status = 'answered'; q.answer = text; q.answered_by = String(by).slice(0, 40); q.answered_at = now(); q.source = source;
+  const imp = G.impactOf(p, q);
+  q.impact = imp;
+  const fb = { category: `Answer ${q.id}`, comment: `Question ${q.id} [${q.req_ids.join(', ')}]: ${q.text}\nAnswer (${q.answered_by}): ${text}\nApply this decision; do not ask it again.` };
+  const reset = [], requeued = [];
+  for (const id of imp.all) {
+    const m = p.modules.find(x => x.id === id);
+    if (!m) continue;
+    m.feedback = fb;
+    if (m.status === 'running') { m.requeue = true; requeued.push(id); continue; }
+    if (m.status === 'pending' && !m.attempts) continue;               // 未着手：次の実行で回答を受け取るだけ
+    const had = m.status !== 'pending';
+    m.status = G.heldBy(p, m).some(x => x.module === m.id) ? 'on_hold' : 'pending';
+    if (had) m.version = (m.version || 1) + 1;
+    m.attempts = 0; m.error = null; delete m.transient;
+    if (m.review && m.review.decision === 'rejected') delete m.review;  // 前回の差し戻しより回答を優先
+    reset.push(id);
+  }
+  pushEvent(p, { stage: 'development', kind: 'gate', text: `✓ ${q.id} answered by ${q.answered_by} → impact: ${imp.direct.join(', ') || '—'}${imp.dependents.length ? ` (+ dependents ${imp.dependents.join(', ')})` : ''} · reset to pending: ${reset.join(', ') || 'none'}${requeued.length ? ` · re-queue after run: ${requeued.join(', ')}` : ''} · other modules untouched` });
+  draftLesson(p, { from: 'question', ref: q.id, stage: 'development', draft: G.lessonDraft({ kind: 'question', req_ids: q.req_ids, question: q.text, answer: text }) });
+  syncDevelopment(p);
+  save(); kick(p);
+  return { question: q, impact: imp, reset, requeued };
+}
+
+/** 教訓の下書きを作る（人が承認するまでスキルには入らない）。 */
+function draftLesson(p, { from, ref, stage, draft }) {
+  const list = (p.lessons ||= []);
+  const l = { id: nextId(list, 'L'), from, ref, stage: stage || '', draft, status: 'draft', created_at: now() };
+  list.push(l);
+  if (list.length > 200) { const i = list.findIndex(x => x.status !== 'draft'); if (i >= 0) list.splice(i, 1); }   // 処理済みの古いものから捨てる
+  pushEvent(p, { stage: stage || 'project', kind: 'info', text: `✎ lesson draft ${l.id} from ${from} ${ref} — approve it to append to the project skill "${G.lessonSkillName(l.stage)}"` });
+  return l;
+}
+
+/** 教訓を承認：段階ごとの案件専用スキル（role: project）に 1 行追記。無ければ作る。body で文面を直せる。 */
+export function approveLesson(p, lid, { body, by = 'Human', source = 'direct' } = {}) {
+  const l = G.lessonsOf(p).find(x => x.id === lid);
+  if (!l) throw new HttpError(404, `Lesson not found: ${lid}`);
+  if (l.status !== 'draft') throw new HttpError(409, `Lesson ${lid} is already ${l.status}`);
+  const line = String(body ?? l.draft).trim();
+  if (!line) throw new HttpError(400, 'Lesson text cannot be empty');
+  humanOnly(p, `Approving lesson ${lid}`, by, source);
+  const name = G.lessonSkillName(l.stage);
+  let skill = skillsOf(p).find(s => s.name === name && (s.stage || '') === l.stage && G.roleOf(s) === 'project');
+  if (skill) {
+    const next = `${skill.body}\n${line}`;
+    if (next.length > SKILL_LIMIT.body) throw new HttpError(400, `Skill "${name}" would exceed ${SKILL_LIMIT.body} characters — consolidate it on the Skills page first`);
+    skill.body = next;
+    pushEvent(p, { stage: 'project', kind: 'artifact', text: `Lesson ${lid} appended to skill ${skill.id}"${name}" (${by})` });
+  } else {
+    skill = addSkill(p, { name, body: `Lessons from rejections and answered questions in this project. Follow them.\n${line}`, stage: l.stage, role: 'project', editor: `Lesson ${lid}` }, { silent: true });
+    pushEvent(p, { stage: 'project', kind: 'artifact', text: `Lesson ${lid} → new project skill ${skill.id}"${name}" (${by})` });
+  }
+  l.status = 'approved'; l.text = line; l.skill = skill.id; l.by = String(by).slice(0, 40); l.at = now();
+  save();
+  return { lesson: l, skill };
+}
+
+export function dismissLesson(p, lid, { by = 'Human' } = {}) {
+  const l = G.lessonsOf(p).find(x => x.id === lid);
+  if (!l) throw new HttpError(404, `Lesson not found: ${lid}`);
+  if (l.status !== 'draft') throw new HttpError(409, `Lesson ${lid} is already ${l.status}`);
+  l.status = 'dismissed'; l.by = String(by).slice(0, 40); l.at = now();
+  pushEvent(p, { stage: l.stage || 'project', kind: 'info', text: `Lesson ${lid} dismissed (${l.by})` });
+  save();
+  return l;
 }
 
 /* ---------- 汇总指标 ---------- */
@@ -1304,7 +1721,7 @@ function readLayout(p, st) {
   const layers = declared.length ? declared : (p.arch && p.arch.layers && p.arch.layers.length ? p.arch.layers : agent.DEFAULT_LAYERS);   // ARC-01 优先 → 分类自带的Folder convention → 平台default
   const resolved = stack || p.tech || '';
   const pro = exec.profileOf(resolved);
-  pushEvent(p, { stage: 'architecture', kind: 'step', text: `Tech stack: ${resolved || '(not specified)'}${stack ? ' (from ARC-01; ' + (p.tech ? 'matches user input' : 'user did not specify; model chose') + ')' : ''}` });
+  pushEvent(p, { stage: 'architecture', kind: 'step', text: `Tech stack: ${resolved || '(not specified)'}${stack ? ' (from ARC-01; ' + (!p.tech ? 'user did not specify; model chose' : stack === p.tech ? 'matches user input' : `differs from user input "${p.tech}"`) + ')' : ''}` });
   pushEvent(p, { stage: 'architecture', kind: 'step', text: `Language profile: ${pro.label} → source ${pro.id === 'java' || pro.id === 'cap-java' ? 'src/main/java/<layer>/' : 'src/<layer>/'}, test/ ${pro.testPath('layer', 'order-service.test' + pro.ext)}; ${pro.cds ? 'includes CDS modeling (db/schema.cds, srv/*.cds)' : 'no CDS'}; gate checks real runner exit code` });
   pushEvent(p, { stage: 'architecture', kind: 'step', text: declared.length
     ? `Source folder convention: ${layers.join(' / ')} (from ARC-01 "source folder layout") → module source goes directly to src/<layer>/ (named by business meaning, no WBS index)`
@@ -1316,6 +1733,14 @@ const archLayers = (p) => (p.arch && p.arch.layers && p.arch.layers.length) ? p.
 /* ---------- Tech stack → 言語プロファイル(决定代码扩展名、Folder convention、真跑命令) ---------- */
 export const stackOf = (p) => (p.arch && p.arch.stack) || p.tech || '';
 export const prof = (p) => exec.profileOf(stackOf(p));
+
+/** WBS 結果を保存：deps を DAG に正規化(未指定ならレイヤー順で推定)してからモジュールを計画。 */
+function storeWbs(p, r) {
+  const layers = archLayers(p);
+  const epics = G.normalizeDeps(r.epics.map((e, i) => ({ ...e, layer: agent.validLayer(layers, String(e.layer || '').toLowerCase()) || agent.layerAt(layers, i) })), layers);
+  p.wbs = { epics, task_count: r.task_count, generated_at: r.generated_at || now(), model: r.model || null };
+  p.modules = planModules(p, p.wbs, layers);
+}
 
 /** 每个 Epic 一modules；use folder来自架构规约(Epic 自报 layer，非法则按序回落)。 */
 function planModules(p, wbs, layers) {
@@ -1329,6 +1754,8 @@ function planModules(p, wbs, layers) {
     used.add(slugName);
     return {
       id: `M${i + 1}`, epic: e.id, name: e.name, goal: e.goal, layer,
+      deps: (e.deps || []).map(d => `M${String(d).replace(/\D/g, '')}`),                    // Epic En ↔ Module Mn
+      req_ids: [...new Set([...(e.req_ids || []), ...(e.tasks || []).flatMap(t => t.req_ids || [])])],
       slug: slugName, dir: agent.modDirOf(profile, layer), test_path_planned: agent.testPathOf(profile, layer, i, e.name),
       profile: profile.id,
       status: 'pending', version: 0, attempts: 0, agent: null, files: [], unit_tests: null, artifacts: [], review: null, error: null,

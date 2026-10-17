@@ -35,17 +35,20 @@ const HOST = process.env.AI_PLATFORM_HOST || '127.0.0.1';
 
 H.load();
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
 const clients = new Set();
 H.subscribe(ev => { const line = `data: ${JSON.stringify(ev)}\n\n`; for (const res of clients) { try { res.write(line); } catch { clients.delete(res); } } });
 
 const json = (res, code, obj) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(obj)); };
 const readBody = (req) => new Promise((resolve) => { let b = ''; req.on('data', c => { b += c; if (b.length > 4e6) req.destroy(); }); req.on('end', () => { try { resolve(b ? JSON.parse(b) : {}); } catch { resolve({}); } }); });
 
+/** 承認の出どころ：画面のボタンは x-approval-source: dashboard を付ける。無ければ API 直叩き（自動化）扱い。 */
+const approvalSource = (req) => (String(req.headers['x-approval-source'] || '').toLowerCase() === 'dashboard' ? 'dashboard' : 'api');
+
 /* ---------- 路由 ---------- */
 
 const routes = [
-  ['GET', /^\/api\/state$/, () => ({ ...H.state(), channel: H.channelInfo(), runtime: H.runtimeInfo(), stages: H.stagesMeta(), workflows: H.WORKFLOWS, types: H.TYPES, default_model: H.DEFAULT_MODEL })],
+  ['GET', /^\/api\/state$/, () => ({ ...H.state(), projects: H.state().projects.map(H.withGovernance), channel: H.channelInfo(), runtime: H.runtimeInfo(), stages: H.stagesMeta(), workflows: H.WORKFLOWS, types: H.TYPES, default_model: H.DEFAULT_MODEL })],
   ['GET', /^\/api\/settings$/, () => settings.getAllPublic()],
   ['GET', /^\/api\/settings\/enabled-models$/, () => ({ models: settings.listEnabledModels(), defaultProvider: (settings.getDefaultProvider() || {}).id || '' })],
   ['PUT', /^\/api\/settings\/providers\/([^/]+)$/, async (m, body) => settings.setProvider(m[1], body || {})],
@@ -78,12 +81,19 @@ const routes = [
   ['POST', /^\/api\/projects\/([^/]+)\/rebuild$/, (m, body) => H.rebuildProject(m[1], { force: body?.force === true })],
   ['DELETE', /^\/api\/projects\/([^/]+)$/, (m, body, url) => H.removeProject(m[1], { force: url.searchParams.get('force') === '1' || body.force === true })],
   ['POST', /^\/api\/projects\/([^/]+)\/stages\/([^/]+)\/run$/, (m) => { const p = H.must(m[1]); H.checkStageRunnable(p, m[2]); H.runStage(p, m[2]).catch(e => console.error('[run]', e.message)); return { ok: true }; }],
-  ['POST', /^\/api\/projects\/([^/]+)\/stages\/([^/]+)\/approve$/, async (m, body) => H.approveStage(H.must(m[1]), m[2], body.reviewer)],
+  ['POST', /^\/api\/projects\/([^/]+)\/stages\/([^/]+)\/approve$/, async (m, body, url, req) => H.approveStage(H.must(m[1]), m[2], body.reviewer, { source: approvalSource(req), ackGaps: body.ack_gaps === true })],
   ['POST', /^\/api\/projects\/([^/]+)\/stages\/([^/]+)\/reject$/, async (m, body) => H.rejectStage(H.must(m[1]), m[2], body)],
   ['POST', /^\/api\/projects\/([^/]+)\/modules\/([^/]+)\/run$/, (m) => { const p = H.must(m[1]); const mod = H.checkModuleRunnable(p, m[2]); H.runModule(p, mod).catch(e => console.error('[run]', e.message)); return { ok: true }; }],
-  ['POST', /^\/api\/projects\/([^/]+)\/modules\/([^/]+)\/approve$/, async (m, body) => H.approveModule(H.must(m[1]), m[2], body.reviewer)],
+  ['POST', /^\/api\/projects\/([^/]+)\/modules\/([^/]+)\/approve$/, async (m, body, url, req) => H.approveModule(H.must(m[1]), m[2], body.reviewer, { source: approvalSource(req) })],
   ['POST', /^\/api\/projects\/([^/]+)\/modules\/([^/]+)\/reject$/, async (m, body) => H.rejectModule(H.must(m[1]), m[2], body)],
   ['GET', /^\/api\/projects\/([^/]+)\/summary$/, (m) => H.summary(H.must(m[1]))],
+  ['GET', /^\/api\/projects\/([^/]+)\/trace$/, (m) => H.trace(H.must(m[1]))],
+  ['GET', /^\/api\/projects\/([^/]+)\/asis$/, (m, body, url) => H.asIs(H.must(m[1]), String(url.searchParams.get('screen') || ''))],
+  ['POST', /^\/api\/projects\/([^/]+)\/ux\/important$/, (m, body) => H.markImportant(H.must(m[1]), String(body.screen || ''), body.on !== false)],
+  ['POST', /^\/api\/projects\/([^/]+)\/skills\/plan$/, (m, body) => H.applySkillPlan(H.must(m[1]), { dryRun: body.dry_run === true })],
+  ['POST', /^\/api\/projects\/([^/]+)\/questions\/([^/]+)\/answer$/, async (m, body, url, req) => H.answerQuestion(H.must(m[1]), m[2], { answer: body.answer, by: body.by, source: approvalSource(req) })],
+  ['POST', /^\/api\/projects\/([^/]+)\/lessons\/([^/]+)\/approve$/, async (m, body, url, req) => H.approveLesson(H.must(m[1]), m[2], { body: body.body, by: body.by, source: approvalSource(req) })],
+  ['POST', /^\/api\/projects\/([^/]+)\/lessons\/([^/]+)\/dismiss$/, async (m, body) => H.dismissLesson(H.must(m[1]), m[2], { by: body.by })],
 ];
 
 /* ---------- 服务 ---------- */
@@ -118,7 +128,7 @@ const server = http.createServer(async (req, res) => {
       if (!m) continue;
       pathMatched = true;
       if (req.method !== method) continue;          // 同路径不同方法：继续找匹配的那条
-      try { return json(res, 200, await fn(m, await readBody(req), url)); }
+      try { return json(res, 200, await fn(m, await readBody(req), url, req)); }
       catch (e) { return json(res, e.status || 500, { error: e.message || 'internal error' }); }
     }
     return pathMatched ? json(res, 405, { error: 'method not allowed' }) : json(res, 404, { error: 'no such api' });

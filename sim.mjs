@@ -13,7 +13,7 @@ export function hash(s) { let h = 2166136261; for (let i = 0; i < String(s).leng
 export function planSteps(project, stage) {
   const base = {
     requirements: ['プロジェクト概要を確認', 'ユーザーと利用場面を整理', '機能要件を分解', '業務ルールと例外を定義', '受入基準を作成'],
-    ux: ['情報構造を設計', 'ナビゲーションと画面一覧を設計', '画面仕様を定義'],
+    ux: ['情報構造を設計', 'ナビゲーションと画面一覧を設計', '画面仕様を定義', '共通テンプレートと画面プロトタイプを準備'],
     architecture: ['システム境界とレイヤーを設計', 'データモデルを設計', 'API 契約を定義'],
     wbs: ['要件と成果物を対応付け', '結合度に基づきエピックを分割', 'タスクとファイルの担当を割り当て'],
     testing: ['ワークスペースのテスト結果を集計', 'カバレッジと不足を集計'],
@@ -21,6 +21,23 @@ export function planSteps(project, stage) {
     operations: ['メトリクスとログを設定', 'アラートしきい値を設定'],
   }[stage.id] || ['エージェントタスクを実行'];
   return base.map((text, i) => ({ text: `${stage.agent} · ${text}`, ms: 200 + (hash(stage.id + i) % 4) * 100 }));
+}
+
+/* ---------- UX プロトタイプ（離線：決定的。モデル通道と同じ形を返す） ---------- */
+
+/** デザインシステム：既定トークン + 既定ファンクションキー（project 名だけ反映）。 */
+export function uxDesign(project) {
+  return { system: String(project.name || '業務システム').slice(0, 20), tokens: {}, fkeys: [] };
+}
+
+/** 重要画面のハイファイ内容：抽出項目はそのまま、件数・ガイダンス・状態注記を決定的に足す。 */
+export function uxHifi(project, scr, base) {
+  return {
+    search: base.search, columns: base.columns, detail: base.detail,
+    rows: 6 + (hash(scr.id) % 5),
+    message: scr.form === 'report' ? '出力条件を入力して F9（印刷）を押してください。' : '検索条件を入力して F2（検索）を押してください。',
+    notes: ['状態：0 件時は「該当データがありません」を一覧に表示', '権限なし時は F5（登録）を非活性'],
+  };
 }
 
 /* ---------- 文档产物（离线模板） ---------- */
@@ -60,6 +77,7 @@ const STACK_LABEL = {
   java: 'Java 21 + Spring Boot 3.3 レイヤー構造（javac/java 実際にコンパイル・実行；サードパーティ依存なし）',
   'cap-java': 'SAP CAP Java（CDS + Java，javac/java 実際にコンパイル・実行；CDS は構造を検証）',
   'cap-node': 'SAP CAP Node.js（CDS + Node.js ESM，node --test）',
+  'ts-node': 'Next.js + NestJS + PostgreSQL 16（TypeScript · npm 許可リスト依存 · tsx + node --test · PostgreSQL は Docker で統合テスト）',
 };
 const layoutSection = (project) => {
   const pro = profileOf(project.arch?.stack || project.tech || '');
@@ -85,10 +103,17 @@ const layoutSection = (project) => {
 `;
 };
 
+// 依存グラフの見本：E3 は E1・E2 に、E4 は E3 に依存。E1・E2・E5 は独立なので並行に着手できる。
+const SIM_DEPS = [[], [], ['E1', 'E2'], ['E3'], []];
+
 export function planWbs(project) {
   const ls = (project.arch && project.arch.layers && project.arch.layers.length) ? project.arch.layers : DEFAULT_LAYERS;
+  // 要件台帳の ID を各 Epic に順番に割り当てる（オフラインでも網羅率 100% のトレースになる）
+  const ids = ((project.ledger && project.ledger.items) || []).filter(it => !it.parent).map(it => it.id);
+  const reqOf = (i) => ids.filter((_, k) => k % 5 === i);
   const epics = ['Core utilities', 'Data models', 'Business logic', 'API adapters', 'Quality and delivery'].map((name, i) => ({
     id: `E${i + 1}`, name, layer: ls[i % ls.length], goal: `${name}：単体テスト可能な純粋関数モジュールを提供`,
+    deps: SIM_DEPS[i], req_ids: reqOf(i),
     tasks: ['主要関数を実装', '境界条件を処理'].map((t, j) => ({
       id: `E${i + 1}-T${j + 1}`, name: `${name} ${t}`,
       files: `src/${ls[i % ls.length]}/<business-name>.mjs`, acceptance: `タスク「${name} ${t}」の単体テストがすべて成功する`, status: 'todo',
@@ -157,6 +182,83 @@ test('groupBy groups by key', () => {
 
 test('groupBy returns an empty object for non-array input', () => {
   assert.deepEqual(groupBy(null, String), {});
+});
+`;
+
+/* TypeScript 档案（NestJS / PostgreSQL）：Repository インターフェース + InMemory 実装 + pg 実装、Service はインターフェースだけに依存。 */
+const TS_SRC = (name) => `/** オフラインテンプレート：${name}（Repository 層経由で DB にアクセス） */
+import 'reflect-metadata';
+import { Injectable } from '@nestjs/common';
+
+export interface Item { id: string; name: string; qty: number }
+
+export interface ItemRepository {
+  findById(id: string): Promise<Item | null>;
+  save(item: Item): Promise<void>;
+}
+
+export class InMemoryItemRepository implements ItemRepository {
+  private readonly rows = new Map<string, Item>();
+  async findById(id: string): Promise<Item | null> { return this.rows.get(id) ?? null; }
+  async save(item: Item): Promise<void> { this.rows.set(item.id, { ...item }); }
+}
+
+/** PostgreSQL 実装：pg の Pool 互換オブジェクトを注入（パラメータ化 SQL のみ）。 */
+export class PgItemRepository implements ItemRepository {
+  constructor(private readonly pool: { query: (sql: string, args?: unknown[]) => Promise<{ rows: any[] }> }) {}
+  async init(): Promise<void> { await this.pool.query('CREATE TABLE IF NOT EXISTS items (id text PRIMARY KEY, name text NOT NULL, qty integer NOT NULL)'); }
+  async findById(id: string): Promise<Item | null> {
+    const r = await this.pool.query('SELECT id, name, qty FROM items WHERE id = $1', [id]);
+    return r.rows[0] ?? null;
+  }
+  async save(item: Item): Promise<void> {
+    await this.pool.query('INSERT INTO items (id, name, qty) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET name = $2, qty = $3', [item.id, item.name, item.qty]);
+  }
+}
+
+@Injectable()
+export class ItemService {
+  constructor(private readonly repo: ItemRepository) {}
+  async adjust(id: string, delta: number): Promise<Item> {
+    const cur = await this.repo.findById(id);
+    if (!cur) throw new Error(\`item not found: \${id}\`);
+    if (cur.qty + delta < 0) throw new RangeError('qty must not go negative');
+    const next = { ...cur, qty: cur.qty + delta };
+    await this.repo.save(next);
+    return next;
+  }
+}
+`;
+
+const TS_TEST = (dir, moduleName, base) => `import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { ItemService, InMemoryItemRepository, PgItemRepository } from '../../${dir}/${base}';
+
+// モジュール：${moduleName}
+
+test('adjust adds delta through the repository', async () => {
+  const repo = new InMemoryItemRepository();
+  await repo.save({ id: 'A', name: 'bolt', qty: 3 });
+  assert.deepEqual(await new ItemService(repo).adjust('A', 2), { id: 'A', name: 'bolt', qty: 5 });
+  assert.equal((await repo.findById('A'))?.qty, 5);
+});
+
+test('adjust rejects negative stock and unknown ids', async () => {
+  const repo = new InMemoryItemRepository();
+  await repo.save({ id: 'A', name: 'bolt', qty: 1 });
+  await assert.rejects(() => new ItemService(repo).adjust('A', -2), RangeError);
+  await assert.rejects(() => new ItemService(repo).adjust('Z', 1), /item not found: Z/);
+});
+
+test('PgItemRepository round-trips against PostgreSQL', { skip: !process.env.DATABASE_URL && 'PostgreSQL unavailable' }, async () => {
+  const { Pool } = await import('pg');
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  try {
+    const repo = new PgItemRepository(pool);
+    await repo.init();
+    await repo.save({ id: 'pg-1', name: 'nut', qty: 7 });
+    assert.deepEqual(await repo.findById('pg-1'), { id: 'pg-1', name: 'nut', qty: 7 });
+  } finally { await pool.end(); }
 });
 `;
 
@@ -259,7 +361,19 @@ service OrderService {
 }
 `;
 
+/** オフライン疑問：担当 ID の名前に「未定 / TBD / 要確認」があれば、回答済みでない限り人に確認する（疑問・変更台帳の動作確認用）。 */
+export function simQuestions(project, mod) {
+  const answered = new Set((project.questions || []).filter(q => q.status === 'answered').flatMap(q => q.req_ids || []));
+  const items = ((project.ledger && project.ledger.items) || []).filter(it => (mod.req_ids || []).includes(it.id));
+  return items.filter(it => /未定|TBD|要確認/i.test(it.name || '') && !answered.has(it.id))
+    .map(it => ({ req_ids: [it.id], text: `${it.id}「${it.name}」の仕様が未確定です。どう実装すべきか決めてください。` }));
+}
+
 export function moduleCode(project, mod) {
+  return { ...templateCode(project, mod), questions: simQuestions(project, mod) };
+}
+
+function templateCode(project, mod) {
   // 目录由 harness 按架构规约算好（mod.dir / mod.test_path_planned），这里只照写。
   const profile = profileOf((project.arch && project.arch.stack) || project.tech || '');
   const layer = mod.layer || 'core';
@@ -275,6 +389,12 @@ export function moduleCode(project, mod) {
     summary: `オフラインテンプレートモジュール（Java · ${mod.name}）`,
     files: [{ path: `${dir}/${srcFile}`, content: JAVA_SRC(mod.name, cls) }, ...cds],
     test: { path: testPath, content: JAVA_TEST(mod.name, cls) },
+  };
+  if (profile.id === 'ts-node') return {
+    summary: `オフラインテンプレートモジュール（TypeScript · NestJS / PostgreSQL · ${mod.name}）`,
+    files: [{ path: `${dir}/${srcFile}`, content: TS_SRC(mod.name) }],
+    test: { path: testPath, content: TS_TEST(dir, mod.name, cls) },
+    deps: ['pg', '@types/pg'],
   };
   if (profile.id === 'python') return {
     summary: `オフラインテンプレートモジュール（Python · ${mod.name}）`,

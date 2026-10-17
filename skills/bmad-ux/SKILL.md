@@ -10,7 +10,7 @@ metadata:
 # BMAD · UX Prototype Spec
 
 ## Overview
-Spec the user journey and key screens as a thin prototype description — enough to lock the architecture and let downstream stages build without UI rework. No pixel-perfect design; no unused variants.
+Spec the user journey and every screen ID as a visible, real-size HTML prototype built from one shared design-system template (search conditions + list + detail + F-key bar), low-fi for all screens and hi-fi for the important ones, captured as screenshots for review against the AS-IS screens. No unused variants. (Superseded by bmad6-ux, which is the primary UX skill.)
 
 ## When to Use
 - Apply: web / mobile / desktop UI project; any surface users interact with.

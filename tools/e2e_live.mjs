@@ -20,7 +20,8 @@ fs.rmSync(DATA, { force: true });
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  PASS  ${m}`); } else { fail++; console.log(`  FAIL  ${m}`); } };
 const get = async (u) => { const r = await fetch(BASE + u); return { status: r.status, body: await r.json() }; };
-const post = async (u, b) => { const r = await fetch(BASE + u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b || {}) }); return { status: r.status, body: await r.json() }; };
+// 承認は画面のボタン操作の代役（人のテスター）なので dashboard ヘッダを付ける
+const post = async (u, b) => { const r = await fetch(BASE + u, { method: 'POST', headers: { 'content-type': 'application/json', ...(/\/approve$/.test(u) ? { 'x-approval-source': 'dashboard' } : {}) }, body: JSON.stringify(b || {}) }); return { status: r.status, body: await r.json() }; };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const waitFor = async (fn, ms = 420000, what = '') => {
   const t0 = Date.now(); let lastLog = t0;

@@ -6,17 +6,20 @@ import { progressOf, stageExecution } from './progress.mjs';
 import { t, setLang, applyStatic, LANGS, lang, audit, has } from './i18n.mjs';
 
 let DB = { projects: [], active: null };
-const S = { view: 'projects', project: null, stage: null, module: null, artifact: null, artTab: 'artifacts', wbsTab: 'tree', epicOpen: {}, wsOpen: {}, reject: null, editArt: null, editFile: null, skillEdit: null, form: { mode: 'human_gate' } };
+const S = { view: 'projects', project: null, stage: null, module: null, artifact: null, artTab: 'artifacts', wbsTab: 'tree', epicOpen: {}, wsOpen: {}, reject: null, editArt: null, editFile: null, skillEdit: null, traceFilter: 'all', answers: {}, lessonText: {}, form: { mode: 'human_gate' } };
 let WS = { projectId: null, files: [], path: null, content: '', loading: false, modCount: -1, at: 0 };
 /** 模块已落盘的文件总数：工作区列表的缓存失效依据（模块完成会变，文件系统被外部改动不会变）。 */
 const modFileCount = (p) => (p?.modules || []).reduce((n, m) => n + (m.files || []).length, 0);
 /** 缓存是否过期：换了项目 / 模块文件数变了 / 上次加载卡住超过 5 秒（否则「工作区里后来才有文件」会一直显示空列表）。 */
 const wsStale = (p) => !p || WS.projectId !== p.id || WS.modCount !== modFileCount(p) || (WS.loading && Date.now() - WS.at > 5000);
+let ASIS = {};                         // UX ゲート：画面 ID → 現行資料の抜粋（/api/.../asis、表示時に取得してキャッシュ）
 let DRAFT = { key: null, text: '' };   // 编辑中的草稿（SSE 重渲染时不丢字）
 let PICKS = [];                        // 新建项目时选中的上传文件（File 对象，重渲染不丢）
 let EPICKS = [];                       // 编辑项目时补的输入资料（同 PICKS，两个表单互不干扰）
 let SKDRAFT = { name: '', body: '', stage: '' };   // 技能表单草稿：SSE 重渲染时不丢用户正在输的字
 let SKPICK = new Set();                            // 技能列表里勾选待批量删除的（按 id，重渲染不丢）
+const HIGH_RISK = ['requirements', 'architecture'];   // サーバー governance.HIGH_RISK_STAGES と同じ既定
+let SKPLAN = null;                                 // 段階別スキル割当の差分プレビュー { projectId, diff }
 let PEDIT = null;                                  // 正在编辑的项目信息（右侧那一栏变成「编辑项目」表单；SSE 重渲染不丢）
 let NPTYPE = null, NPWF = null;                    // 新建表单里用户选的分类/流程（SSE 重渲染不丢，提交后清空）
 let CATALOG = null, catalogLoading = false;        // 预设技能库（skills/*.md），进技能页时拉一次
@@ -26,7 +29,7 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '
 const fmtTime = (iso) => (iso || '').replace('T', ' ').slice(0, 19);
 
 const STS = { pending: { get t() { return t('st.pending'); }, c: 'bare' }, running: { get t() { return t('st.running'); }, c: 'run' }, awaiting_review: { get t() { return t('st.awaiting'); }, c: 'warn' }, approved: { get t() { return t('st.approved'); }, c: 'ok' }, rejected: { get t() { return t('st.rejected'); }, c: 'fail' }, failed: { get t() { return t('st.failed'); }, c: 'fail' } };
-const MSTS = { pending: { get t() { return t('st.awaiting_dev'); }, c: 'bare' }, running: { get t() { return t('st.developing'); }, c: 'run' }, awaiting_review: { get t() { return t('st.awaiting_appr'); }, c: 'warn' }, approved: { get t() { return t('st.approved'); }, c: 'ok' }, rejected: { get t() { return t('st.rejected'); }, c: 'fail' }, failed: { get t() { return t('st.failed'); }, c: 'fail' } };
+const MSTS = { pending: { get t() { return t('st.awaiting_dev'); }, c: 'bare' }, running: { get t() { return t('st.developing'); }, c: 'run' }, awaiting_review: { get t() { return t('st.awaiting_appr'); }, c: 'warn' }, approved: { get t() { return t('st.approved'); }, c: 'ok' }, rejected: { get t() { return t('st.rejected'); }, c: 'fail' }, failed: { get t() { return t('st.failed'); }, c: 'fail' }, on_hold: { get t() { return t('st.on_hold'); }, c: 'warn' } };
 const FLOWSTATE = { approved: 'delivered', running: 'running', awaiting_review: 'review', rejected: 'rejected', failed: 'rejected', pending: 'pending' };
 // 分类值保持稳定（会发给服务端并存库），只有显示文案跟着语言走
 const REJECT_CATS = [['requirement', 'cat.requirement'], ['architecture', 'cat.arch'], ['ux', 'cat.ux'], ['technical', 'cat.tech'], ['security', 'cat.security'], ['business', 'cat.business']];
@@ -46,7 +49,7 @@ const pill = (status, map) => { const s = (map || STS)[status] || { t: status, c
 const PROGRESS_PHASES = {
   started: 'starting', preparing: 'preparing', planned: 'planned',
   'generating code': 'code', 'files written': 'written', 'running tests': 'tests',
-  'generating artifacts': 'artifacts', 'generating WBS': 'wbs', verifying: 'verifying',
+  'generating artifacts': 'artifacts', 'generating WBS': 'wbs', verifying: 'verifying', 'generating prototypes': 'prototypes',
 };
 function executionBar(item, label, compact = false) {
   const percent = progressOf(item);
@@ -120,6 +123,73 @@ function artifactOwner(p, a) {
   return p.stages.find(s => (s.artifacts || []).some(x => x.id === a.id))
     || p.modules.find(m => (m.artifacts || []).some(x => x.id === a.id)) || null;
 }
+/* ---------- 文件型产物（html / image）：本文在工作区文件里，经 /p/<pid>/ 预览路由显示 ---------- */
+const artUrl = (p, rel) => `/p/${encodeURIComponent(p.id)}/${String(rel || '').split('/').map(encodeURIComponent).join('/')}`;
+const isScreenArt = (a) => a && a.group === 'screens';
+const screenArts = (list) => (list || []).filter(a => a.group === 'screens' && a.type === 'html');
+const GALLERY_ID = 'UX-GALLERY';
+const isImportant = (p, a) => (Array.isArray(p.ux_important) ? p.ux_important.includes(a.screen) : !!a.important);
+
+/** 产物正文：markdown → prose；html → 沙箱 iframe（不给脚本、不给同源）；image → 内联图片。 */
+function artBody(p, a) {
+  if (a.type === 'html') return `<div class="proto-wrap"><iframe class="proto" sandbox="" loading="lazy" src="${esc(artUrl(p, a.path))}" title="${esc(a.name)}"></iframe></div>`
+    + (a.shot ? `<div class="proto-shot"><div class="lb">${esc(t('ux.shot'))} · <span class="mono">${esc(a.shot)}</span></div><img src="${esc(artUrl(p, a.shot))}" alt="${esc(a.name)}" loading="lazy"></div>` : '');
+  if (a.type === 'image') return `<div class="art-img"><img src="${esc(artUrl(p, a.path))}" alt="${esc(a.name)}"></div>`;
+  return `<div class="prose">${md(a.content || '')}</div>`;
+}
+
+/** 画面ギャラリー：撮影があればサムネイル、無ければ ID だけのプレースホルダ（iframe を数百枚並べない）。 */
+function screenGallery(p, list, { attr = 'data-artifact', sel = null } = {}) {
+  if (!list.length) return '';
+  return `<div class="gallery">${list.map(a => `<button type="button" class="gcard${a.screen === sel || a.id === sel ? ' sel' : ''}" ${attr}="${esc(attr === 'data-artifact' ? a.id : a.screen)}" title="${esc(a.name)}">
+    <div class="thumb">${a.shot ? `<img loading="lazy" src="${esc(artUrl(p, a.shot))}" alt="">` : `<span class="mono">${esc(a.screen)}</span><span class="tiny muted">${esc(t('ux.noShot'))}</span>`}</div>
+    <div class="gmeta"><span class="mono">${isImportant(p, a) ? '★ ' : ''}${esc(a.screen)}</span><span class="pill ${a.fidelity === 'high' ? 'acc' : 'bare'}">${a.fidelity === 'high' ? 'Hi-Fi' : 'Lo-Fi'}</span></div>
+    <div class="gname">${esc(String(a.name || '').replace(a.screen, '').trim() || '—')}</div></button>`).join('')}</div>`;
+}
+
+function loadAsIs(p, screen) {
+  const key = `${p.id}:${screen}`;
+  if (key in ASIS) return;
+  ASIS[key] = null;
+  api.get(`/api/projects/${encodeURIComponent(p.id)}/asis?screen=${encodeURIComponent(screen)}`)
+    .then(r => { ASIS[key] = r; }).catch(e => { ASIS[key] = { error: e.message }; })
+    .finally(() => { if (S.project === p.id) render(true); });
+}
+
+/** UX ゲート：AS-IS（現行資料の画面帳票イメージ）と TO-BE（プロトタイプの撮影）を左右に並べる。 */
+function uxCompare(p, st) {
+  const list = screenArts(st.artifacts);
+  if (!list.length) return '';
+  const a = list.find(x => x.screen === S.uxScreen) || list.find(x => isImportant(p, x)) || list[0];
+  S.uxScreen = a.screen;
+  const i = list.indexOf(a), imp = isImportant(p, a);
+  const asis = ASIS[`${p.id}:${a.screen}`];
+  if (asis === undefined) loadAsIs(p, a.screen);
+  const left = !asis ? `<div class="muted tiny">${esc(t('msg.loading'))}</div>`
+    : asis.error ? `<div class="tiny" style="color:var(--fail)">${esc(asis.error)}</div>`
+    : `${(asis.images || []).map(src => `<img class="asis-img" src="${esc(artUrl(p, src))}" alt="${esc(src)}">`).join('')}${asis.text
+      ? `<pre class="asis">${esc(asis.text)}</pre><div class="tiny muted mono">${esc(asis.file)}:${asis.line}</div>`
+      : (asis.images || []).length ? '' : `<div class="muted tiny">${esc(t('ux.asis.none'))}</div>`}`;
+  const right = a.shot ? `<img class="tobe" src="${esc(artUrl(p, a.shot))}" alt="${esc(a.name)}">`
+    : `<div class="proto-wrap"><iframe class="proto" sandbox="" src="${esc(artUrl(p, a.path))}" title="${esc(a.name)}"></iframe></div><div class="tiny muted">${esc(t('ux.noShot'))}</div>`;
+  return `<div class="card ux-compare">
+    <header><h2>${esc(t('ux.compare'))}</h2><span class="kicker mono">${esc(a.name)}</span>
+      <span class="right" style="display:flex;gap:6px;align-items:center">
+        <button class="btn" data-ux-step="-1"${i ? '' : ' disabled'}>←</button><span class="mono tiny">${i + 1}/${list.length}</span><button class="btn" data-ux-step="1"${i < list.length - 1 ? '' : ' disabled'}>→</button>
+        <button class="btn${imp ? ' warn' : ''}" data-ux-important="${esc(a.screen)}" data-on="${imp ? '0' : '1'}" title="${esc(t('ux.important.hint'))}">${imp ? '★' : '☆'} ${esc(t('ux.important'))}</button>
+        <a class="btn" target="_blank" rel="noopener" href="${esc(artUrl(p, a.path))}">↗ ${esc(t('ux.open'))}</a>
+      </span></header>
+    <div class="body cmp">
+      <div><div class="lb">AS-IS · ${esc(t('ux.asis'))}</div>${left}</div>
+      <div><div class="lb">TO-BE · ${a.fidelity === 'high' ? 'Hi-Fi' : 'Lo-Fi'} · ${esc(t(a.spec_from === 'as-is' ? 'ux.from.asis' : 'ux.from.default'))}</div>${right}</div>
+    </div></div>`;
+}
+const uxGateLine = (p, s) => {
+  const list = screenArts(s.artifacts);
+  if (!list.length) return '';
+  return `<div class="gd">${esc(t('ux.gateLine', { n: list.length, hi: list.filter(a => a.fidelity === 'high').length, shots: list.filter(a => a.shot).length }))}</div>`;
+};
+
 /** 工作区文件 → 归属模块：生成记录里精确匹配 → 该文件所在层目录里只有这一个模块。
     （文件名用业务语义、不带 WBS 序号，所以不靠名字里的模块号认领。） */
 function moduleOfFile(p, rel) {
@@ -231,6 +301,10 @@ const VIEWS = {
               </select>
               <div class="hint big" id="editModeHint">${esc(PEDIT.mode === 'auto' ? t('proj.mode.auto') : t('proj.mode.human'))}</div>
             </div>
+            <div><label class="lb">${esc(t('proj.gates'))}</label>
+              <div style="display:flex;flex-wrap:wrap;gap:10px">${(DB.stages || []).map(s => `<label class="tiny"><input type="checkbox" name="human_gates" value="${esc(s.id)}"${(PEDIT.human_gates || HIGH_RISK).includes(s.id) ? ' checked' : ''}> ${esc(stageLabel(s))}</label>`).join('')}</div>
+              <div class="hint">${esc(t('proj.gates.hint'))}</div>
+            </div>
             <div>
               <label class="lb">${esc(t('proj.inputs'))}</label>
               <input class="field" type="file" name="files" multiple
@@ -306,6 +380,10 @@ const VIEWS = {
               </select>
               <div class="hint big" id="modeHint">${esc(t('proj.mode.human'))}</div>
             </div>
+            <div><label class="lb">${esc(t('proj.gates'))}</label>
+              <div style="display:flex;flex-wrap:wrap;gap:10px">${(DB.stages || []).map(s => `<label class="tiny"><input type="checkbox" name="human_gates" value="${esc(s.id)}"${HIGH_RISK.includes(s.id) ? ' checked' : ''}> ${esc(stageLabel(s))}</label>`).join('')}</div>
+              <div class="hint">${esc(t('proj.gates.hint'))}</div>
+            </div>
             <div>
               <label class="lb">${esc(t('proj.inputs'))}</label>
               <input class="field" type="file" name="files" multiple
@@ -358,7 +436,8 @@ const VIEWS = {
     const p = P(); if (!p) return noProject();
     const sel = p.stages.find(s => s.id === S.stage) || p.stages.find(s => s.status !== 'approved') || p.stages[0];
     S.stage = sel.id;
-    const arts = (sel.artifacts || []).map(a => `<div class="row" data-artifact="${esc(a.id)}"><span class="id mono">${esc(a.id)}</span><span class="nm">${esc(a.name)}</span><span class="stat">${pill(a.status === 'approved' ? 'approved' : 'pending', { approved: { t: 'approved', c: 'ok' }, pending: { t: 'generated', c: 'run' } })}</span></div>`).join('') || `<div class="muted tiny" style="padding:10px 14px">${esc(t('com.empty'))}</div>`;
+    const screens = screenArts(sel.artifacts);
+    const arts = (sel.artifacts || []).filter(a => !isScreenArt(a)).map(a => `<div class="row" data-artifact="${esc(a.id)}"><span class="id mono">${esc(a.id)}</span><span class="nm">${esc(a.name)}</span><span class="stat">${pill(a.status === 'approved' ? 'approved' : 'pending', { approved: { t: 'approved', c: 'ok' }, pending: { t: 'generated', c: 'run' } })}</span></div>`).join('') || `<div class="muted tiny" style="padding:10px 14px">${esc(t('com.empty'))}</div>`;
     const hist = (sel.review && sel.review.decision === 'rejected') ? `<div class="gate" style="margin-top:8px"><div class="gt">${esc(t('gate.rejectTitle'))}</div><div class="gd">〔${esc(sel.review.category)}〕${esc(sel.review.comment || '—')} · ${fmtTime(sel.review.at)}</div></div>` : '';
     return `
       <div class="page-head">
@@ -374,7 +453,7 @@ const VIEWS = {
           <span><i style="background:var(--line-2)"></i>${esc(t('gate.legend.pending'))}</span>
         </div>
       </div></div>
-      <div class="grid g-1-2${sel.kind === 'development' ? '' : ' g-fill'}">
+      <div class="grid g-1-2${sel.kind === 'development' || screens.length ? '' : ' g-fill'}">
         <div class="card">
           <header><h2>${esc(stageLabelN(p, sel))}</h2><span class="kicker">${esc(sel.agent)}</span><span class="right">${pill(sel.status)}</span></header>
           <div class="body insp">
@@ -386,18 +465,68 @@ const VIEWS = {
               <div class="k">${esc(t('stage.started'))}</div><div class="v mono">${sel.started_at ? fmtTime(sel.started_at) : '—'}</div>
               <div class="k">${esc(t('stage.finished'))}</div><div class="v mono">${sel.finished_at ? fmtTime(sel.finished_at) : '—'}</div>
               <div class="k">${esc(t('stage.model'))}</div><div class="v">${modelSelect(p, sel.id)}</div>
+              <div class="k">${esc(t('gate.policy'))}</div><div class="v">${gateHuman(p, sel.id) ? `<span class="pill acc">${esc(t('gate.human'))}</span>` : `<span class="pill bare">${esc(t('gate.autoOk'))}</span>`}</div>
             </div>
+            ${stageSkills(p, sel.id)}
             ${hist}
             ${gatePanel(p, sel)}
           </div>
         </div>
         <div class="card">
           <header><h2>${esc(t('stage.artifacts'))}</h2><span class="kicker">Artifacts</span><span class="right mono tiny muted">${esc(t('stage.artifactCount', { n: (sel.artifacts || []).length }))}</span></header>
-          <div class="body flush">${arts}</div>
+          <div class="body flush">${arts}${screens.length ? `<div class="stage-gallery"><div class="lb">${esc(t('ux.gallery', { n: screens.length }))}</div>${screenGallery(p, screens, { attr: 'data-ux-screen', sel: S.uxScreen })}</div>` : ''}</div>
           ${gatePanel(p, sel, true)}
         </div>
       </div>
-      ${sel.kind === 'development' ? devSection(p) : ''}`;
+      ${sel.kind === 'development' ? devSection(p) : ''}
+      ${screens.length ? uxCompare(p, sel) : ''}`;
+  }},
+
+  trace: { name: 'Traceability', render() {
+    const p = P(); if (!p) return noProject();
+    const tr = gov(p).trace, L = tr.ledger;
+    const pct = (n) => (L.total ? Math.round(100 * n / L.total) : 0);
+    const STATUS = { uncovered: { t: t('tr.st.uncovered'), c: 'fail' }, planned: { t: t('tr.st.planned'), c: 'run' }, implemented: { t: t('tr.st.implemented'), c: 'ok' } };
+    const rows = tr.rows.filter(r => S.traceFilter === 'all' || r.status === S.traceFilter);
+    const kinds = Object.entries(L.byKind || {});
+    const dagRows = tr.dag.modules.map(m => `<tr>
+        <td class="k">${esc(m.id)}</td><td>${esc(m.name)}</td><td class="k">${esc(m.layer || '')}</td>
+        <td class="k">${m.deps.length ? esc(m.deps.join(', ')) : '—'}</td>
+        <td>${m.blocked_by.length ? `<span class="pill warn">${esc(t('tr.waitOn', { ids: m.blocked_by.join(', ') }))}</span>` : pill(m.status, MSTS)}</td>
+        <td class="n">${m.req_ids.length}</td></tr>`).join('');
+    return `
+      <div class="page-head"><div>${viewTitle('trace', esc(t('view.trace')))}<p>${esc(t('view.trace.desc'))}</p></div></div>
+      ${tr.stack.deviates ? `<div class="gate" style="border-color:color-mix(in oklab,var(--fail) 45%,var(--line));background:var(--fail-dim);margin-bottom:var(--gap)"><div class="gt" style="color:var(--fail)">⚠ ${esc(t('tr.stackDev'))}</div><div class="gd">${esc(t('tr.stackDev.d', { declared: tr.stack.declared, runner: tr.stack.runner }))}${tr.stack.replaced ? ` ${esc(t('tr.stackDev.replaced', { resolved: tr.stack.resolved }))}` : ''}</div></div>` : ''}
+      <div class="kpis">
+        <div class="kpi acc"><div class="k">${esc(t('tr.k.ledger'))}</div><div class="v">${L.total}</div><div class="d">${L.scanned ? esc(t('tr.k.ledger.d', { files: L.scanned.files, kb: Math.round(L.scanned.bytes / 1024) })) : esc(t('tr.k.ledger.none'))}</div></div>
+        <div class="kpi run"><div class="k">${esc(t('tr.k.planned'))}</div><div class="v">${L.planned}<small>/${L.total}</small></div><div class="d">${pct(L.planned)}%</div></div>
+        <div class="kpi"><div class="k">${esc(t('tr.k.impl'))}</div><div class="v">${L.implemented}<small>/${L.total}</small></div><div class="d">${pct(L.implemented)}%</div></div>
+        <div class="kpi ${L.uncovered.length ? 'fail' : ''}"><div class="k">${esc(t('tr.k.uncovered'))}</div><div class="v">${L.uncovered.length}</div><div class="d">${esc(L.uncovered.slice(0, 6).join(', ') || '—')}</div></div>
+        <div class="kpi ${tr.questions && tr.questions.open ? 'warn' : ''}"><div class="k">${esc(t('qa.k.open'))}</div><div class="v">${tr.questions ? tr.questions.open : 0}</div><div class="d">${esc(tr.questions && tr.questions.on_hold.length ? t('qa.k.onHold', { ids: tr.questions.on_hold.join(', ') }) : t('qa.k.answered', { n: tr.questions ? tr.questions.answered : 0 }))}</div></div>
+        <div class="kpi"><div class="k">${esc(t('tr.k.dag'))}</div><div class="v">${tr.dag.modules.filter(m => m.deps.length).length}<small>/${tr.dag.modules.length}</small></div><div class="d">${esc(tr.dag.order.join(' → ') || '—')}</div></div>
+      </div>
+      <div class="grid g-1-2" style="margin-top:var(--gap)">
+        <div class="card"><header><h2>${esc(t('tr.byKind'))}</h2><span class="kicker">Ledger</span></header>
+          <div class="body flush"><table class="data"><tr><th>${esc(t('tr.kind'))}</th><th class="n">${esc(t('tr.total'))}</th><th class="n">${esc(t('tr.k.planned'))}</th><th class="n">${esc(t('tr.k.impl'))}</th></tr>
+            ${kinds.map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td class="n">${v.total}</td><td class="n">${v.planned}</td><td class="n">${v.implemented}</td></tr>`).join('') || `<tr><td colspan="4" class="muted">${esc(t('tr.k.ledger.none'))}</td></tr>`}
+          </table></div>
+          <header><h2>${esc(t('tr.gates'))}</h2><span class="kicker">${esc(p.mode)}</span></header>
+          <div class="body" style="display:flex;flex-wrap:wrap;gap:6px">${tr.gates.stages.map(g => `<span class="pill ${g.human ? 'acc' : 'bare'}">${esc(stageLabelById(g.id, g.id))} · ${esc(g.human ? t('gate.human') : t('gate.autoOk'))}</span>`).join('')}</div>
+        </div>
+        <div class="card"><header><h2>${esc(t('tr.dag'))}</h2><span class="kicker">DAG</span></header>
+          <div class="body flush tablewrap"><table class="data"><tr><th>ID</th><th>${esc(t('tr.module'))}</th><th>${esc(t('code.layer'))}</th><th>${esc(t('tr.deps'))}</th><th>${esc(t('tr.state'))}</th><th class="n">${esc(t('tr.reqs'))}</th></tr>
+            ${dagRows || `<tr><td colspan="6" class="muted">${esc(t('wbs.noModules'))}</td></tr>`}</table></div></div>
+      </div>
+      ${questionsCard(p)}
+      ${lessonsCard(p)}
+      <div class="card" style="margin-top:var(--gap)">
+        <header><h2>${esc(t('tr.ledger'))}</h2><span class="kicker">${rows.length}/${tr.rows.length}</span>
+          <span class="right"><select class="field" data-trace-filter style="width:auto">${['all', 'uncovered', 'planned', 'implemented'].map(v => `<option value="${v}"${S.traceFilter === v ? ' selected' : ''}>${esc(t(`tr.f.${v}`))}</option>`).join('')}</select></span></header>
+        <div class="body flush tablewrap"><table class="data"><tr><th>ID</th><th>${esc(t('tr.kind'))}</th><th>${esc(t('tr.name'))}</th><th>${esc(t('tr.source'))}</th><th>${esc(t('tr.module'))}</th><th>${esc(t('tr.state'))}</th></tr>
+          ${rows.slice(0, 800).map(r => `<tr><td class="k">${esc(r.id)}</td><td class="k">${esc(r.kind)}${r.parent ? ` ← ${esc(r.parent)}` : ''}</td><td>${esc(r.name || '—')}</td><td class="k">${r.source ? esc(`${r.source.file}${r.source.line ? `:${r.source.line}` : ''}`) : esc(r.origin || '')}</td><td class="k">${esc(r.modules.join(', ') || '—')}</td><td>${pill(r.status, STATUS)}</td></tr>`).join('') || `<tr><td colspan="6" class="muted">${esc(t('tr.k.ledger.none'))}</td></tr>`}
+        </table></div>
+        ${rows.length > 800 ? `<div class="foot">${esc(t('tr.more', { n: rows.length - 800 }))}</div>` : ''}
+      </div>`;
   }},
 
   skills: { name: 'Skills', render() {
@@ -416,7 +545,7 @@ const VIEWS = {
       <div class="row" data-skill="${esc(s.id)}" title="${esc(s.body)}">
         <span class="right" style="flex:0 0 auto"><input type="checkbox" data-skill-pick="${esc(s.id)}" ${SKPICK.has(s.id) ? 'checked' : ''} title="${esc(t('sk.pick'))}"></span>
         <span class="id mono">${esc(s.id)}</span>
-        <span class="nmcol"><span class="nm">${esc(s.name)}</span><span class="stat" data-skill-stage="${esc(s.stage || '')}">${skillStageText(s.stage)}</span></span>
+        <span class="nmcol"><span class="nm">${esc(s.name)}</span><span class="stat" data-skill-stage="${esc(s.stage || '')}">${skillStageText(s.stage)} · <span class="pill ${ROLE_PILL[skillRole(s)]}">${esc(t('sk.role.' + skillRole(s)))}</span></span></span>
         <span class="right" style="display:flex;gap:6px">
           <button class="btn warn" data-skill-edit="${esc(s.id)}">${esc(t('act.edit'))}</button>
           <button class="btn danger" data-skill-del="${esc(s.id)}">✕ ${esc(t('sk.del'))}</button>
@@ -431,6 +560,7 @@ const VIEWS = {
       <div class="page-head">
         <div>${viewTitle('skills', esc(t('view.skills')))}<p>${esc(t('view.skills.desc'))}</p></div>
       </div>
+      ${skillPlanCard(p)}
       <div class="grid g-side g-fill g-skills">
         <div class="card">
           <header><h2>${esc(t('sk.list'))}</h2><span class="kicker">${esc(t('sk.count', { n: list.length }))}</span>
@@ -491,7 +621,7 @@ const VIEWS = {
       ${open ? e.tasks.map(tk => `<div class="tnode child s-${st}" data-task="${tk.id}" data-status="${st}"><span class="tw"></span><span class="tid">${tk.id}</span><span class="tn">${esc(tk.name)}</span><span class="stcell"><span class="dot s-${st}${live ? ' live' : ''}"></span><span class="mono tiny muted">${esc(tk.files)}</span></span></div>`).join('') : ''}
       ${open ? `<div class="tnode child"><span class="tw"></span><span class="tid"></span><span class="tn muted">${esc(t('wbs.goal'))}：${esc(e.goal)}</span><span class="stcell"></span></div>` : ''}`;
     }).join('');
-    const legend = `<div class="legend">${['running', 'pending', 'awaiting_review', 'approved', 'failed']
+    const legend = `<div class="legend">${['running', 'pending', 'awaiting_review', 'on_hold', 'approved', 'failed']
       .map(k => `<span class="lg"><span class="dot s-${k}${k === 'running' ? ' live' : ''}"></span>${esc(MSTS[k].t)}</span>`).join('')}</div>`;
     return `
       <div class="page-head">
@@ -546,18 +676,33 @@ const VIEWS = {
       }));
       kicker = `workspace/${p.id}`;
     } else {
-      const sel = arts.find(a => a.id === S.artifact) || arts[0];
+      const screens = screenArts(arts);
+      const listArts = arts.filter(a => !isScreenArt(a));
+      if (screens.length) {                 // 画面プロトタイプは 1 行（ギャラリー）にまとめ、UX 段階の最後に置く
+        const at = listArts.map(a => a.stage).lastIndexOf('ux');
+        listArts.splice(at + 1, 0, { id: GALLERY_ID, name: t('ux.gallery', { n: screens.length }), type: 'gallery', stage: 'ux', stageName: screens[0].stageName, status: screens[0].status });
+      }
+      const gallery = S.artifact === GALLERY_ID && screens.length;
+      const sel = gallery ? null : (arts.find(a => a.id === S.artifact) || listArts[0]);
       if (sel) S.artifact = sel.id;
-      left = arts.map(a => `<div class="row ${a.id === S.artifact ? 'sel' : ''}" data-artifact="${esc(a.id)}"><span class="id mono">${esc(a.id)}</span><span class="nm">${esc(artFullName(p, a))}</span><span class="path">${esc(artOwnerLabel(p, a))}</span></div>`).join('') || `<div class="empty tiny">${esc(t('art.none'))}</div>`;
-      title = sel ? artFullName(p, sel) : '—'; kicker = sel ? sel.id : '';
+      const selRow = isScreenArt(sel) ? GALLERY_ID : S.artifact;
+      left = listArts.map(a => `<div class="row ${a.id === selRow ? 'sel' : ''}" data-artifact="${esc(a.id)}"><span class="id mono">${esc(a.id)}</span><span class="nm">${esc(artFullName(p, a))}</span><span class="path">${esc(artOwnerLabel(p, a))}</span></div>`).join('') || `<div class="empty tiny">${esc(t('art.none'))}</div>`;
+      title = gallery ? t('ux.gallery', { n: screens.length }) : sel ? artFullName(p, sel) : '—'; kicker = gallery ? GALLERY_ID : sel ? sel.id : '';
       const owner = sel ? artifactOwner(p, sel) : null;
       const locked = owner && owner.status === 'approved';
       const wbs = sel && sel.type === 'wbs';
-      if (sel && !wbs && S.editArt === sel.id) {
+      const fileArt = sel && (sel.type === 'html' || sel.type === 'image');
+      if (gallery) {
+        mid = screenGallery(p, screens, { attr: 'data-artifact', sel: null });
+        acts = '';
+      } else if (fileArt) {
+        mid = artBody(p, sel);
+        acts = `${isScreenArt(sel) ? `<button class="btn" data-artifact="${GALLERY_ID}">▦ ${esc(t('ux.backGallery'))}</button>` : ''}<a class="btn" target="_blank" rel="noopener" href="${esc(artUrl(p, sel.path))}">↗ ${esc(t('ux.open'))}</a>`;
+      } else if (sel && !wbs && S.editArt === sel.id) {
         mid = `<textarea class="field" data-edit-area style="min-height:52vh;font:400 12px/1.6 var(--font-mono)">${esc(DRAFT.key === 'art:' + sel.id ? DRAFT.text : sel.content)}</textarea>`;
         acts = `<button class="btn primary" data-save-art="${esc(sel.id)}">${esc(t('act.saveArtifact'))}</button><button class="btn" data-cancel-edit>${esc(t('act.cancel'))}</button>`;
       } else {
-        mid = wbs ? wbsSummary(p) : `<div class="prose">${sel ? md(sel.content) : `<div class="muted tiny">${esc(t('com.chooseArtifact'))}</div>`}</div>`;
+        mid = wbs ? wbsSummary(p) : sel ? artBody(p, sel) : `<div class="prose"><div class="muted tiny">${esc(t('com.chooseArtifact'))}</div></div>`;
         acts = !sel || wbs ? '' : (locked
           ? `<span class="pill v2">${esc(t('gate.lockedStage'))}</span>`
           : `<button class="btn warn" data-edit-art="${esc(sel.id)}">${esc(t('act.edit'))}</button>`);
@@ -574,7 +719,9 @@ const VIEWS = {
             <div class="k">${esc(t('art.meta.id'))}</div><div class="v mono">${esc(a0.id)}</div>
             <div class="k">${esc(t('art.meta.name'))}</div><div class="v">${esc(artFullName(p, a0))}</div>
             <div class="k">${esc(t('art.meta.stage'))}</div><div class="v">${esc(a0 ? artOwnerLabel(p, a0) : '—')}</div>
-            <div class="k">${esc(t('art.meta.type'))}</div><div class="v mono">${esc(a0.type)}</div>
+            <div class="k">${esc(t('art.meta.type'))}</div><div class="v mono">${esc(a0.type || 'markdown')}${a0.fidelity ? ` · ${a0.fidelity === 'high' ? 'Hi-Fi' : 'Lo-Fi'}` : ''}</div>
+            ${a0.path ? `<div class="k">${esc(t('ux.file'))}</div><div class="v mono">${esc(a0.path)}</div>` : ''}
+            ${a0.asis ? `<div class="k">AS-IS</div><div class="v mono">${esc(a0.asis.file)}:${a0.asis.line}</div>` : ''}
             <div class="k">${esc(t('art.meta.version'))}</div><div class="v mono">v${a0.version || 1}</div>
             <div class="k">${esc(t('art.meta.status'))}</div><div class="v">${esc(a0.status)}</div>
             <div class="k">${esc(t('art.meta.at'))}</div><div class="v mono">${a0.at ? fmtTime(a0.at) : '—'}</div>
@@ -786,6 +933,7 @@ const VIEW_ICO = {
   code: ICO('<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M10 12l-2 2 2 2M14 12l2 2-2 2"/>'),
   runs: STAGE_ICO.operations,
   skills: ICO('<path d="M4 5a2 2 0 012-2h13v18H6a2 2 0 01-2-2z"/><path d="M8 3v18"/>'),
+  trace: ICO('<path d="M4 6h6M4 12h6M4 18h6"/><path d="M14 6h6M14 12h6M14 18h6"/><path d="M10 6l4 6M10 12l4 6"/>'),
   settings: ICO('<rect x="3" y="5" width="18" height="5" rx="1.2"/><rect x="3" y="14" width="18" height="5" rx="1.2"/><path d="M7 7.5h.01M7 16.5h.01M11 7.5h6M11 16.5h6"/>'),
 };
 const viewTitle = (id, text) => `<h1>${tico(VIEW_ICO[id])}${text}</h1>`;
@@ -871,16 +1019,23 @@ function gatePanel(p, st, compact) {
     <div class="acts"><button class="btn" data-run-stage="${esc(s.id)}">${esc(t('dev.retry'))}</button></div></div>`;
   if (s.status === 'awaiting_review') {
     if (S.reject && S.reject.kind === 'stage' && S.reject.id === s.id) return rejectForm('stage', s.id);
+    const L = gov(p).trace.ledger;
+    const gaps = s.id === 'wbs' && p.modules.length ? L.uncovered : [];
+    const cov = s.id === 'wbs' && L.total ? `<div class="gd">${esc(t('gate.coverage', { planned: L.planned, total: L.total }))}${gaps.length ? ` · <b style="color:var(--fail)">${esc(t('gate.gaps', { n: gaps.length, ids: gaps.slice(0, 12).join(', ') + (gaps.length > 12 ? ' …' : '') }))}</b>` : ''}</div>` : '';
+    const dev = s.id === 'architecture' && gov(p).trace.stack.deviates ? `<div class="gd" style="color:var(--fail)">⚠ ${esc(t('tr.stackDev.d', { declared: gov(p).trace.stack.declared, runner: gov(p).trace.stack.runner }))}${gov(p).trace.stack.replaced ? ` ${esc(t('tr.stackDev.replaced', { resolved: gov(p).trace.stack.resolved }))}` : ''}</div>` : '';
     return `<div class="gate">
       <div class="gt"><span class="pulse" style="background:var(--warn)"></span>${esc(t('gate.needsReview'))} · ${esc(stageLabelN(P(), s))}</div>
-      <div class="gd">${esc(t('gate.awaitDesc', { n: (s.artifacts || []).length, r: s.attempts + 1 }))}</div>
+      <div class="gd">${esc(t('gate.awaitDesc', { n: (s.artifacts || []).length, r: s.attempts + 1 }))}${p.mode === 'auto' && gateHuman(p, s.id) ? ` ${esc(t('gate.highRisk'))}` : ''}</div>
+      ${cov}${dev}${s.id === 'ux' ? uxGateLine(p, s) : ''}
       <div class="acts">
-        <button class="btn primary" data-approve-stage="${esc(s.id)}">✓ ${esc(t('gate.approveStage'))}</button>
+        ${gaps.length
+          ? `<button class="btn warn" data-approve-stage-ack="${esc(s.id)}">✓ ${esc(t('gate.approveWithGaps', { n: gaps.length }))}</button>`
+          : `<button class="btn primary" data-approve-stage="${esc(s.id)}">✓ ${esc(t('gate.approveStage'))}</button>`}
         <button class="btn danger" data-reject-stage="${esc(s.id)}">✕ ${esc(t('act.reject'))}</button>
       </div></div>`;
   }
   if (s.status === 'running') return `<div class="gate" style="border-color:var(--line);background:var(--panel-2)"><div class="gt" style="color:var(--run)">${esc(s.agent)} ${esc(t('st.running'))}…</div>${st ? '' : executionBar(s, stageLabel(s))}</div>`;
-  if (s.status === 'approved') return `<div class="gate" style="border-color:color-mix(in oklab,var(--ok) 40%,var(--line));background:var(--ok-dim)"><div class="gt" style="color:var(--ok)">✓ ${esc(t('st.approved'))}</div><div class="gd">${esc(s.review?.by || t('gate.reviewBy'))} · ${fmtTime(s.review?.at)}</div></div>`;
+  if (s.status === 'approved') return `<div class="gate" style="border-color:color-mix(in oklab,var(--ok) 40%,var(--line));background:var(--ok-dim)"><div class="gt" style="color:var(--ok)">✓ ${esc(t('st.approved'))}</div><div class="gd">${esc(s.review?.by || t('gate.reviewBy'))} · ${fmtTime(s.review?.at)}${s.review?.source ? ` · ${esc(t('gate.source.' + s.review.source))}` : ''}</div></div>`;
   return `<div class="gate" style="border-color:var(--line);background:var(--panel-2)"><div class="gt" style="color:var(--muted)">${esc(t('st.pending'))}</div><div class="gd">${esc(t('gate.waitPrev'))}<button class="btn" data-run-stage="${esc(s.id)}" style="margin-left:8px">▶ ${esc(t('act.run'))}</button></div></div>`;
 }
 
@@ -914,6 +1069,109 @@ function moduleGate(p, mod, compact) {
 const PROF_LABEL = { node: 'Node.js（ESM / node --test）', java: 'Java（javac + java）', 'cap-java': 'SAP CAP Java（CDS + Java）', 'cap-node': 'SAP CAP Node.js（CDS + ESM）', python: 'Python（stdlib unittest）' };
 const profLabel = (p, m) => PROF_LABEL[m?.profile || p?.arch?.profile] || p?.arch?.profileLabel || PROF_LABEL.node;
 
+const ROLE_PILL = { primary: 'acc', checklist: 'bare', project: 'run' };
+/** サーバーの governance.roleOf と同じ判定（表示用）：明示 > 割当表 > プリセット由来は checklist > 人が書いたものは project。 */
+function skillRole(s) {
+  if (s.role) return s.role;
+  const pid = s.preset || (String(s.by || '').match(/^Preset (\S+)/) || [])[1];
+  if (!pid) return 'project';
+  for (const e of Object.values(gov(P()).skill_plan)) {
+    if (e.primary.some(r => r.id === pid)) return 'primary';
+    if (e.checklist.some(r => r.id === pid)) return 'checklist';
+  }
+  return 'checklist';
+}
+
+/** 段階別スキル割当（§11）：段階ごとの 3 区分と適用ボタン。差分プレビュー → 確認して適用。 */
+function skillPlanCard(p) {
+  const plan = gov(p).skill_plan;
+  const sids = [...p.stages.map(s => s.id), ''].filter(id => plan[id]);
+  if (!sids.length) return '';
+  const todo = sids.reduce((n, id) => n + plan[id].primary.concat(plan[id].checklist).filter(r => !r.applied && r.available).length + plan[id].conflicts.length, 0);
+  const pv = SKPLAN && SKPLAN.projectId === p.id ? SKPLAN.diff : null;
+  const chip = (r) => `<span class="pill ${r.applied ? 'ok' : 'bare'}" title="${esc(r.id)}">${esc(r.name)}</span>`;
+  return `<div class="card" style="margin-bottom:var(--gap)">
+    <header><h2>${esc(t('sk.plan.title'))}</h2><span class="kicker">${esc(t('sk.plan.kicker'))}</span>
+      <span class="right" style="display:flex;gap:8px;align-items:center">
+        <span class="tiny muted">${esc(todo ? t('sk.plan.todo', { n: todo }) : t('sk.plan.ok'))}</span>
+        ${pv ? `<button class="btn primary" data-skill-plan-apply>${esc(t('sk.plan.confirm', { a: pv.add.length, r: pv.remove.length }))}</button><button class="btn" data-skill-plan-cancel>${esc(t('act.cancel'))}</button>`
+          : `<button class="btn ${todo ? 'primary' : ''}" data-skill-plan-preview>${esc(t('sk.plan.preview'))}</button>`}
+      </span></header>
+    ${pv ? `<div class="body"><div class="hint big">${esc(t('sk.plan.diff', { a: pv.add.length, r: pv.remove.length, m: pv.missing.length }))}${pv.remove.length ? ` ${esc(t('sk.plan.removes'))}：${esc(pv.remove.map(x => x.name).join('、'))}` : ''}${pv.missing.length ? ` · ${esc(t('sk.plan.missing'))}：${esc(pv.missing.join(', '))}` : ''}</div></div>` : ''}
+    <div class="body flush tablewrap"><table class="data"><tr><th>${esc(t('sk.stage'))}</th><th>${esc(t('sk.role.primary'))}</th><th>${esc(t('sk.role.checklist'))}</th><th>${esc(t('sk.role.project'))}</th></tr>
+      ${sids.map(id => { const e = plan[id]; return `<tr>
+        <td class="nowrap">${esc(id ? stageLabelById(id, id) : t('sk.stage.all'))}</td>
+        <td>${e.primary.map(chip).join(' ') || '—'}</td>
+        <td>${e.checklist.map(chip).join(' ')}${e.conflicts.length ? `<div style="margin-top:4px">${e.conflicts.map(c => `<span class="pill fail" title="${esc(t('sk.plan.conflicts'))}">✕ ${esc(c.name)}</span>`).join(' ')}</div>` : ''}</td>
+        <td>${[...e.project.have.map(h => `<span class="pill ok">${esc(h.name)}</span>`), ...e.project.suggested.map(n => `<span class="pill bare" title="${esc(t('sk.plan.suggested'))}">＋ ${esc(n)}</span>`)].join(' ')}</td></tr>`; }).join('')}
+    </table></div>
+    <div class="foot">${esc(t('sk.plan.foot'))}</div>
+  </div>`;
+}
+
+/** 疑問・変更台帳：開発エージェントの疑問に人が答える → 影響するモジュールだけ作り直し。未回答を先に。 */
+function questionsCard(p) {
+  const qs = [...(p.questions || [])].sort((a, b) => (a.status === 'open' ? 0 : 1) - (b.status === 'open' ? 0 : 1) || artNum(b.id) - artNum(a.id));
+  const modName = (id) => (p.modules.find(m => m.id === id) || {}).name || '';
+  const item = (q) => {
+    const head = `<div class="qh"><span class="mono">${esc(q.id)}</span>
+      <span class="pill ${q.status === 'open' ? 'warn' : 'ok'}">${esc(t('qa.st.' + q.status))}</span>
+      <span class="pill bare mono" title="${esc(modName(q.module))}">${esc(q.module)}</span>
+      ${(q.req_ids || []).map(id => `<span class="pill acc mono">${esc(id)}</span>`).join('')}
+      <span class="right mono tiny muted">${esc(q.asked_by || '')} · ${esc(fmtTime(q.asked_at))}</span></div>
+      <div class="qt">${esc(q.text)}</div>`;
+    if (q.status === 'open') return `<form class="qa" data-answer-form="${esc(q.id)}" onsubmit="return false">${head}
+      <textarea class="field" data-answer-text="${esc(q.id)}" placeholder="${esc(t('qa.hint'))}">${esc(S.answers[q.id] || '')}</textarea>
+      <div class="acts"><button class="btn primary" data-answer-send="${esc(q.id)}">✓ ${esc(t('qa.answer'))}</button><span class="tiny muted">${esc(t('qa.answerNote'))}</span></div></form>`;
+    const imp = q.impact || { direct: [], dependents: [] };
+    return `<div class="qa">${head}
+      <div class="qt"><b>${esc(t('qa.a'))}</b> ${esc(q.answer || '')} <span class="tiny muted">— ${esc(q.answered_by || '')} · ${esc(fmtTime(q.answered_at))}</span></div>
+      <div class="tiny muted">${esc(t('qa.impact', { direct: imp.direct.join(', ') || '—', deps: imp.dependents.join(', ') || '—' }))}</div></div>`;
+  };
+  const open = qs.filter(q => q.status === 'open').length;
+  return `<div class="card" style="margin-top:var(--gap)">
+    <header><h2>${esc(t('qa.title'))}</h2><span class="kicker">Questions &amp; changes</span><span class="right mono tiny muted">${esc(t('qa.count', { open, n: qs.length }))}</span></header>
+    <div class="body flush">${qs.map(item).join('') || `<div class="empty tiny">${esc(t('qa.none'))}</div>`}</div>
+    <div class="foot">${esc(t('qa.foot'))}</div></div>`;
+}
+
+/** 教訓の下書き：差し戻し・回答から作られ、人が承認すると段階ごとの案件専用スキルに追記される。 */
+function lessonsCard(p) {
+  const all = p.lessons || [];
+  const drafts = all.filter(l => l.status === 'draft');
+  const done = all.filter(l => l.status === 'approved').length;
+  const rows = drafts.map(l => `<form class="qa" data-lesson-form="${esc(l.id)}" onsubmit="return false">
+      <div class="qh"><span class="mono">${esc(l.id)}</span><span class="pill bare">${esc(t('ls.from.' + l.from))} ${esc(l.ref)}</span>
+        <span class="pill ${ROLE_PILL.project}">${esc(t('sk.role.project'))} · ${esc(l.stage ? stageLabelById(l.stage, l.stage) : t('sk.stage.all'))}</span>
+        <span class="right mono tiny muted">${esc(fmtTime(l.created_at))}</span></div>
+      <textarea class="field" data-lesson-text="${esc(l.id)}">${esc(S.lessonText[l.id] ?? l.draft)}</textarea>
+      <div class="acts"><button class="btn primary" data-lesson-approve="${esc(l.id)}">✓ ${esc(t('ls.approve'))}</button><button class="btn" data-lesson-dismiss="${esc(l.id)}">${esc(t('ls.dismiss'))}</button></div></form>`).join('');
+  return `<div class="card" style="margin-top:var(--gap)">
+    <header><h2>${esc(t('ls.title'))}</h2><span class="kicker">Lessons → project skill</span><span class="right mono tiny muted">${esc(t('ls.count', { n: drafts.length, done }))}</span></header>
+    <div class="body flush">${rows || `<div class="empty tiny">${esc(t('ls.none'))}</div>`}</div>
+    <div class="foot">${esc(t('ls.foot'))}</div></div>`;
+}
+
+/** /api/state が付ける計算済み統制情報（古いサーバー応答でも落ちないように既定値）。 */
+const EMPTY_GOV = { trace: { ledger: { total: 0, planned: 0, implemented: 0, uncovered: [], byKind: {} }, rows: [], dag: { order: [], modules: [] }, gates: { stages: [] }, stack: { deviates: false } }, skill_plan: {} };
+const gov = (p) => (p && p.governance) || EMPTY_GOV;
+const gateHuman = (p, sid) => !!(gov(p).trace.gates.stages.find(g => g.id === sid) || {}).human;
+
+/** 段階に割り当てたスキル：主軸ワークフロー / チェックリスト / 案件専用（+ 外すべきものが残っていれば赤）。 */
+function stageSkills(p, sid) {
+  const e = gov(p).skill_plan[sid];
+  if (!e) return '';
+  const chip = (r) => `<span class="pill ${r.applied ? 'ok' : 'bare'}" title="${esc(r.id)}${r.applied ? '' : ` · ${t('sk.plan.notImported')}`}">${esc(r.name)}</span>`;
+  const row = (label, html) => `<div class="k">${esc(label)}</div><div class="v" style="display:flex;flex-wrap:wrap;gap:4px">${html || '<span class="muted tiny">—</span>'}</div>`;
+  const proj = [...e.project.have.map(h => `<span class="pill ok">${esc(h.name)}</span>`), ...e.project.suggested.map(n => `<span class="pill bare" title="${esc(t('sk.plan.suggested'))}">＋ ${esc(n)}</span>`)].join('');
+  return `<div class="hr"></div><div class="kv">
+    ${row(t('sk.role.primary'), e.primary.map(chip).join(''))}
+    ${row(t('sk.role.checklist'), e.checklist.map(chip).join(''))}
+    ${row(t('sk.role.project'), proj)}
+    ${e.conflicts.length ? row(t('sk.plan.conflicts'), e.conflicts.map(c => `<span class="pill fail" title="${esc(c.id)}">${esc(c.name)}</span>`).join('')) : ''}
+  </div>`;
+}
+
 function devSection(p) {
   const running = p.modules.filter(m => m.status === 'running');
   const rows = p.modules.map(m => {
@@ -923,7 +1181,7 @@ function devSection(p) {
       <div class="mod-name"><span class="mn">${esc(m.name)}</span>${executionBar(m, m.name, true)}</div>
       <span>${pill(m.status, MSTS)}</span>
       <span class="mt">${ut ? esc(t('dev.modUnit', { p: ut.passed, t: ut.total, c: ut.exit_code })) : '—'}</span>
-      <span class="mt">${esc(m.agent || m.epic)}</span>
+      <span class="mt" title="${esc(t('tr.deps'))}">${(m.deps || []).length ? `← ${esc(m.deps.join(','))}` : esc(m.agent || m.epic)}</span>
     </div>`;
   }).join('') || `<div class="empty tiny">${esc(t('wbs.noModules'))}</div>`;
   const sel = p.modules.find(m => m.id === S.module) || p.modules.find(m => m.status === 'awaiting_review') || p.modules[0];
@@ -938,6 +1196,7 @@ function devSection(p) {
         ${sel ? executionBar(sel, t('progress.execution')) : ''}
         ${sel ? (S.reject && S.reject.kind === 'module' && S.reject.id === sel.id ? rejectForm('module', sel.id)
           : sel.status === 'awaiting_review' ? moduleGate(p, sel)
+          : sel.status === 'on_hold' ? `<div class="gate"><div class="gt"><span class="pulse" style="background:var(--warn)"></span>${esc(t('qa.holdTitle', { id: sel.id }))}</div><div class="gd">${(p.questions || []).filter(q => q.status === 'open' && q.module === sel.id).map(q => `<div><span class="mono">${esc(q.id)}</span> [${esc((q.req_ids || []).join(', '))}] ${esc(q.text)}</div>`).join('')}</div><div class="acts"><button class="btn primary" data-view="trace">${esc(t('qa.goAnswer'))}</button></div></div>`
           : sel.status === 'failed' ? `<div class="gate" style="border-color:color-mix(in oklab,var(--fail) 45%,var(--line));background:var(--fail-dim)"><div class="gt" style="color:var(--fail)">${esc(t('dev.failed'))}</div><div class="gd">${esc(sel.error || t('dev.noDetail'))}</div><div class="acts"><button class="btn" data-run-module="${esc(sel.id)}">${esc(t('dev.retry'))}</button></div></div>`
           : `<div class="gate" style="border-color:var(--line);background:var(--panel-2)"><div class="gt" style="color:var(--ink-2)">${MSTS[sel.status].t}</div><div class="gd">${esc(sel.status === 'pending' ? t('dev.waitPrevModule') : sel.status === 'approved' ? t('dev.approvedAt', { by: sel.review?.by || '', at: fmtTime(sel.review?.at) }) : t('dev.running'))}</div>${sel.status === 'pending' && isNextModule(p, sel) ? `<div class="acts"><button class="btn" data-run-module="${esc(sel.id)}">${esc(t('dev.start'))}</button></div>` : ''}</div>`) : ''}
         ${sel && sel.dir ? `<div class="kv">
@@ -945,6 +1204,8 @@ function devSection(p) {
             <div class="k">${esc(t('code.layer'))}</div><div class="v mono">${esc(sel.layer || '—')}</div>
             <div class="k">${esc(t('code.dir'))}</div><div class="v mono">${esc(sel.dir)}/</div>
             <div class="k">${esc(t('dev.testPath'))}</div><div class="v mono">${esc(sel.test_path_planned || sel.test_path || '—')}</div>
+            <div class="k">${esc(t('tr.deps'))}</div><div class="v mono">${esc((sel.deps || []).join(', ') || '—')}${(() => { const w = (gov(p).trace.dag.modules.find(x => x.id === sel.id) || {}).blocked_by || []; return w.length ? ` <span class="pill warn">${esc(t('tr.waitOn', { ids: w.join(', ') }))}</span>` : ''; })()}</div>
+            <div class="k">${esc(t('tr.reqs'))}</div><div class="v mono" style="overflow-wrap:anywhere">${esc((sel.req_ids || []).join(', ') || '—')}</div>
           </div><div class="hr"></div>` : ''}
         ${ut ? `<div class="kv">
             <div class="k">${esc(t('code.unitTests'))}</div><div class="v mono">PASS=${ut.passed} FAIL=${ut.failed} exit=${ut.exit_code} ${ut.ms}ms</div>
@@ -956,7 +1217,10 @@ function devSection(p) {
       </div></div>
   </div>`;
 }
-function isNextModule(p, m) { return p.modules.find(x => x.status === 'pending' || x.status === 'rejected')?.id === m.id; }
+function isNextModule(p, m) {
+  const blocked = new Set(gov(p).trace.dag.modules.filter(x => x.blocked_by.length).map(x => x.id));
+  return p.modules.find(x => (x.status === 'pending' || x.status === 'rejected') && !blocked.has(x.id))?.id === m.id;
+}
 
 function wbsSummary(p) {
   return `<div class="prose">${md(`# WBS Breakdown\n\n${p.wbs.epics.length} Epics / ${p.wbs.task_count} Tasks.\n\n` + p.wbs.epics.map(e => `## ${e.id} ${e.name}\nGoal: ${e.goal}\n` + e.tasks.map(t => `- ${t.id} ${t.name} (\`${t.files}\`)`).join('\n')).join('\n\n'))}</div>`;
@@ -980,6 +1244,7 @@ function render(keepScroll) {
   document.getElementById('navArtifacts').textContent = p ? allArtifacts(p).length : 0;
   document.getElementById('navCode').textContent = p ? p.modules.reduce((n, m) => n + (m.files || []).length, 0) : 0;
   document.getElementById('navSkills').textContent = p ? (p.skills || []).length : 0;
+  { const L = gov(p).trace.ledger, nt = document.getElementById('navTrace'); if (nt) nt.textContent = p && L.total ? `${Math.round(100 * L.planned / L.total)}%` : '—'; }
   const ns = document.getElementById('navSettings');
   if (ns) {
     const enabled = (SETTINGS_CACHE && SETTINGS_CACHE.providers) ? SETTINGS_CACHE.providers.filter(x => x.enabled && x.hasKey).length : 0;
@@ -1098,6 +1363,7 @@ document.addEventListener('click', (e) => {
     if (p) PEDIT = {
       id: p.id, name: p.name, brief: p.brief || '', tech: p.tech || '', mode: p.mode,
       type: p.type || (DB.types || [])[0]?.id || '', workflow: p.workflow || 'full',   // 只用来显示（两个下拉都是 disabled）
+      human_gates: Array.isArray(p.human_gates) ? p.human_gates : null,              // null = 旧データ → 既定(HIGH_RISK)で表示
     };
     return render(true);
   }
@@ -1142,6 +1408,18 @@ document.addEventListener('click', (e) => {
   if (st) { S.stage = st.dataset.stage; return render(true); }
   const md_ = el('[data-module]');
   if (md_) { S.module = md_.dataset.module; return render(true); }
+  const us = el('[data-ux-screen]');
+  if (us) { S.uxScreen = us.dataset.uxScreen; return render(true); }
+  const ust = el('[data-ux-step]');
+  if (ust) {
+    const st = P()?.stages.find(s => s.id === S.stage);
+    const list = st ? screenArts(st.artifacts) : [];
+    const i = list.findIndex(a => a.screen === S.uxScreen) + Number(ust.dataset.uxStep);
+    if (list[i]) S.uxScreen = list[i].screen;
+    return render(true);
+  }
+  const uim = el('[data-ux-important]');
+  if (uim) return act(async () => { await api.post(`/api/projects/${S.project}/ux/important`, { screen: uim.dataset.uxImportant, on: uim.dataset.on === '1' }); });
   const art = el('[data-artifact]');
   if (art) { S.artifact = art.dataset.artifact; if (S.view !== 'artifacts') { S.view = 'artifacts'; } return go('artifacts'); }
   const ep = el('[data-epic]');
@@ -1239,13 +1517,22 @@ document.addEventListener('click', (e) => {
 
   // 门禁
   const ap = el('[data-approve-stage]');
-  if (ap) return act(() => api.post(`/api/projects/${S.project}/stages/${ap.dataset.approveStage}/approve`, { reviewer: 'Manual review' }));
+  if (ap) return act(() => api.approve(`/api/projects/${S.project}/stages/${ap.dataset.approveStage}/approve`, { reviewer: 'Manual review' }));
   const rj = el('[data-reject-stage]');
   if (rj) { S.reject = { kind: 'stage', id: rj.dataset.rejectStage, category: REJECT_CATS[0], comment: '' }; return render(true); }
   const rs = el('[data-run-stage]');
   if (rs) return act(() => api.post(`/api/projects/${S.project}/stages/${rs.dataset.runStage}/run`, {}));
+  const apa = el('[data-approve-stage-ack]');
+  if (apa) {
+    const n = (gov(P()).trace.ledger.uncovered || []).length;
+    if (!confirm(t('gate.ackConfirm', { n }))) return;
+    return act(() => api.approve(`/api/projects/${S.project}/stages/${apa.dataset.approveStageAck}/approve`, { reviewer: 'Manual review', ack_gaps: true }));
+  }
+  if (el('[data-skill-plan-preview]')) return act(async () => { SKPLAN = { projectId: S.project, diff: await api.post(`/api/projects/${S.project}/skills/plan`, { dry_run: true }) }; });
+  if (el('[data-skill-plan-apply]')) return act(async () => { await api.post(`/api/projects/${S.project}/skills/plan`, {}); SKPLAN = null; });
+  if (el('[data-skill-plan-cancel]')) { SKPLAN = null; return render(true); }
   const am = el('[data-approve-module]');
-  if (am) return act(() => api.post(`/api/projects/${S.project}/modules/${am.dataset.approveModule}/approve`, { reviewer: 'Manual review' }));
+  if (am) return act(() => api.approve(`/api/projects/${S.project}/modules/${am.dataset.approveModule}/approve`, { reviewer: 'Manual review' }));
   const rm = el('[data-reject-module]');
   if (rm) { S.reject = { kind: 'module', id: rm.dataset.rejectModule, category: REJECT_CATS[0], comment: '' }; return render(true); }
   const runm = el('[data-run-module]');
@@ -1259,12 +1546,29 @@ document.addEventListener('click', (e) => {
     return act(() => api.post(path, body));
   }
   if (el('[data-reject-cancel]')) { S.reject = null; return render(true); }
+
+  // 疑問・変更台帳 / 教訓
+  const ans = el('[data-answer-send]');
+  if (ans) {
+    const qid = ans.dataset.answerSend, text = (S.answers[qid] || '').trim();
+    if (!text) return alert(t('qa.empty'));
+    return act(async () => { await api.approve(`/api/projects/${S.project}/questions/${qid}/answer`, { answer: text, by: 'Manual review' }); delete S.answers[qid]; });
+  }
+  const la = el('[data-lesson-approve]');
+  if (la) {
+    const lid = la.dataset.lessonApprove;
+    return act(async () => { await api.approve(`/api/projects/${S.project}/lessons/${lid}/approve`, { body: S.lessonText[lid], by: 'Manual review' }); delete S.lessonText[lid]; });
+  }
+  const ld = el('[data-lesson-dismiss]');
+  if (ld) return act(async () => { await api.post(`/api/projects/${S.project}/lessons/${ld.dataset.lessonDismiss}/dismiss`, { by: 'Manual review' }); delete S.lessonText[ld.dataset.lessonDismiss]; });
 });
 
 document.addEventListener('input', (e) => {
   if (e.target.matches('[data-edit-area]')) DRAFT = { key: DRAFT.key, text: e.target.value };
   if (e.target.matches('[data-reject-comment]')) S.reject.comment = e.target.value;
   if (e.target.matches('[data-reject-cat]')) S.reject.category = e.target.value;
+  if (e.target.matches('[data-answer-text]')) S.answers[e.target.dataset.answerText] = e.target.value;
+  if (e.target.matches('[data-lesson-text]')) S.lessonText[e.target.dataset.lessonText] = e.target.value;
   /* LLM 服务表单：草稿同步到 SETTINGS_DRAFT，方便 SSE/重渲染不丢 */
   const f = e.target.closest('[data-provider]');
   if (f && e.target.matches('[data-field]')) {
@@ -1359,7 +1663,7 @@ document.addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
     const id = e.target.dataset.id;
-    const values = { name: f.get('name'), tech: f.get('tech'), brief: f.get('brief'), mode: f.get('mode') };
+    const values = { name: f.get('name'), tech: f.get('tech'), brief: f.get('brief'), mode: f.get('mode'), human_gates: f.getAll('human_gates') };
     if (f.get('type')) values.type = f.get('type');          // disabled 的字段不会进 FormData → 不发就表示「不改」
     if (f.get('workflow')) values.workflow = f.get('workflow');
     const files = await readPicks(EPICKS);                   // 补输入资料（和新建同一套读取规则）
@@ -1376,8 +1680,13 @@ document.addEventListener('submit', async (e) => {
   PICKS = [];
   NPTYPE = null; NPWF = null;                              // 建完回到默认分类/默认流程
   await act(() => api.post('/api/projects', {
-    name: f.get('name'), type: f.get('type'), tech: f.get('tech'), brief: f.get('brief'), mode: f.get('mode'), workflow: f.get('workflow'), files,
+    name: f.get('name'), type: f.get('type'), tech: f.get('tech'), brief: f.get('brief'), mode: f.get('mode'), workflow: f.get('workflow'), human_gates: f.getAll('human_gates'), files,
   }), true);
+});
+
+document.addEventListener('change', (e) => {      // トレーサビリティ：台帳の表示フィルタ
+  if (!e.target.matches('[data-trace-filter]')) return;
+  S.traceFilter = e.target.value; render(true);
 });
 
 document.addEventListener('change', (e) => {      // 软件分类 → 带出默认流程 + 该分类的技术栈建议（新建与编辑两个表单共用同一套）
@@ -1430,11 +1739,13 @@ async function refreshAll() {
 const api = {
   async get(url) { const r = await fetch(url); if (!r.ok) throw new Error((await r.json()).error || r.statusText); return r.json(); },
   async post(url, body) { return send('POST', url, body); },
+  /** 承認：画面からの人の操作であることをサーバーに伝える（ヘッダなしの API 承認は human_gate で拒否される）。 */
+  async approve(url, body) { return send('POST', url, body, { 'x-approval-source': 'dashboard' }); },
   async put(url, body) { return send('PUT', url, body); },
   async del(url) { return send('DELETE', url); },
 };
-async function send(method, url, body) {
-  const r = await fetch(url, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+async function send(method, url, body, extra = {}) {
+  const r = await fetch(url, { method, headers: { 'content-type': 'application/json', ...extra }, body: JSON.stringify(body || {}) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;

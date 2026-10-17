@@ -10,6 +10,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { PROFILES, profileOf } from './exec.mjs';
 import * as settings from './settings.mjs';
+import * as exec from './exec.mjs';
+import * as G from './governance.mjs';
 
 const TIMEOUT_MS = Number(process.env.AI_PLATFORM_TIMEOUT_MS || 180000);
 const MAX_OUT = 65536;             // 单次输出上限（重试时直接给满，不再小步试探）
@@ -318,24 +320,44 @@ ${parts.join('\n\n')}\n`;
 
 const SKILL_PROMPT_MAX = 18000;
 
+/** チェックリスト用の抜粋：Verification / Red Flags 節だけ（無ければ冒頭）。本文全体は注入しない。 */
+const CHECK_MAX = 700;
+export function checklistExcerpt(body) {
+  const b = String(body || '');
+  const md = [...b.matchAll(/^##\s*(Verification|Red Flags)[^\n]*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/gm)].map(m => `${m[1]}: ${m[2].trim()}`);
+  const agx = md.length ? [] : [...b.matchAll(/【(Verification|Red Flags)】([\s\S]*?)(?=【|$)/g)].map(m => `${m[1]}: ${m[2].trim()}`);
+  const pick = (md.length ? md : agx).join('\n') || b;
+  const t = pick.replace(/\n{2,}/g, '\n');
+  return t.length > CHECK_MAX ? `${t.slice(0, CHECK_MAX).trimEnd()} …` : t;
+}
+
+const ROLE_MARK = { primary: '（主軸ワークフロー：手順はこれに従う）', checklist: '（チェックリスト：提出前に照合）' };
+
+/**
+ * 2 段階注入：① 索引（全スキルの名前と区分）は常に、② 本文は 主軸ワークフロー・案件専用 だけ全文、
+ * チェックリストは Verification / Red Flags の抜粋だけ。段階が違うスキルは索引にも入れない。
+ */
 export function skillsBrief(project, stageId = '') {
   const ok = (s) => s && s.name && s.body;
   const forStage = (a) => (stageId ? a.filter(s => !s.stage || s.stage === stageId) : a);
   const ws = forStage((project && Array.isArray(project.ws_skills) ? project.ws_skills : []).filter(ok));
   const own = forStage((project && Array.isArray(project.skills) ? project.skills : []).filter(ok));
-  const list = [...ws, ...own];
+  const order = { primary: 0, project: 1, checklist: 2 };
+  const list = [...ws, ...own.sort((a, b) => order[G.roleOf(a)] - order[G.roleOf(b)])];
   if (!list.length) return '';
   const kept = []; let used = 0, dropped = 0;
   for (const s of list) {
-    const mark = s.from === 'workspace' ? '（本项目工作区自带 · 优先）' : '';
-    const line = `- 【${s.name}】${mark}${s.body}`;
+    const role = G.roleOf(s);
+    const mark = s.from === 'workspace' ? '（本项目工作区自带 · 优先）' : (ROLE_MARK[role] || '');
+    const line = `- 【${s.name}】${mark}${role === 'checklist' ? checklistExcerpt(s.body) : s.body}`;
     if (used + line.length > SKILL_PROMPT_MAX) { dropped++; continue; }
     kept.push(line); used += line.length;
   }
+  const index = list.length > 1 ? `スキル索引（${list.length} 件）：${list.map(s => `${s.name}[${s.from === 'workspace' ? 'workspace' : G.roleOf(s)}]`).join('、')}\n` : '';
   const tag = '本项目「技能库」（逐条遵守；**优先级：工作区自带技能 > 项目技能库 > 平台通用默认**；冲突时以更靠前的为准）'
     + (stageId ? '' : '（本次不带阶段过滤）');
   const tail = dropped ? `\n- （另有 ${dropped} 条技能因提示词预算未注入：请精简技能或按阶段拆分）` : '';
-  return `\n${tag}：\n${kept.join('\n')}${tail}\n`;
+  return `\n${tag}：\n${index}${kept.join('\n')}${tail}\n`;
 }
 
 /* ---------- 阶段交付物 ---------- */
@@ -356,7 +378,17 @@ const LAYOUT_RULE =
 {"stack":"Next.js + NestJS + PostgreSQL","layers":[{"dir":"core","responsibility":"…"},{"dir":"domain","responsibility":"…"}]}
 \`\`\`
 - 层名只用小写字母/数字/连字符，3–6 层；后续每个开发模块的源码都会按这个清单归档到 \`src/<层>/（直接放在レイヤーディレクトリ里，**不许再建模块子目录、文件名也不带 WBS 序号**；用业务语义命名，如 OrderService.java、order-service.mjs、order_service.py）\`，层要与模块划分对得上。
-- 技術スタック要与实际能落地的代码一致（本项目代码是サードパーティ依存なし的 Node ESM，技術スタック里可以写目標架构，但目录规约必须是可执行的）。`;
+- 技術スタック要与实际能落地的代码一致。执行器能真跑的栈：① TypeScript + NestJS / Next.js + PostgreSQL 16（npm 依存许可清单内的包由平台写进 package.json 并真 npm install；単体テスト = tsx + node --test；PostgreSQL 由 Docker 起 postgres:16 供集成测试，没有 Docker 时明确记为 skipped）② Node.js ESM（无依存）③ Python 3 標準ライブラリ ④ Java（JDK のみ、Spring 等は実行不可）。用户指定了这些可执行的栈就**原样采用，不要为了「零依赖」把它改写成别的栈**；DB アクセスは Repository 層（インターフェース + InMemory 実装 + PostgreSQL 実装）で隔离；目录规约必须是可执行的。`;
+
+/** UX 段階：文書だけで終わらせない（以前の「thin spec / no pixel design」は撤廃）。HTML プロトタイプはこの後に台帳の画面 ID ごとに生成・撮影される。 */
+const UX_RULE =
+`本文档的附加硬性要求（UX は「見える成果物」で確認する）：
+- 実寸の画面プロトタイプ（HTML）と撮影画像を台帳の画面・帳票 ID ごとに 1 枚ずつ作る前提で書くこと。「薄い仕様だけ・ピクセルデザインはしない」方針は採らない。
+- 共通テンプレート（ヘッダ：システム名・画面 ID・画面名／検索条件／一覧／明細／ファンクションキー F1〜F12、F2=検索・F5=登録・F12=終了は全画面共通）を定義し、全画面がそれに従うこと。
+- 画面 ID ごとに：検索項目・一覧項目・明細項目（項目名・型・桁数・必須・初期値・エラー時表示）と状態（読込中・0 件・エラー・権限なし・閲覧のみ）を表で示すこと。
+- 全画面はローファイ、業務上重要な画面（利用頻度・件数が多い画面）はハイファイで職員のユーザビリティ確認に使うことを明記すること。
+
+`;
 
 async function oneArtifact(project, stage, spec, feedback, allNames, extra = '') {
   const [id, name] = spec;
@@ -385,13 +417,60 @@ ${extra}要求：
 
 export const artifactSpec = (stageId) => ARTIFACT_SPECS[stageId] || [['DOC-01', 'ステージ成果物']];
 
+/** 段階ごとに要件台帳から渡す索引（要約ではなく ID そのもの）。 */
+function ledgerExtra(project, stageId) {
+  if (!G.ledgerItems(project).length) return '';
+  if (stageId === 'requirements') return `要件台帳（入力資料の全文から抽出済み。ID\t種別\t名称）：\n${G.ledgerIndex(project, { max: 10000 })}\n本文はこの ID を見出し・表で参照し、要件を要約で丸めないこと。台帳に無い要件を書く場合だけ FR-/NFR- 番号を新設する。\n\n`;
+  if (stageId === 'architecture') return `要件台帳のテーブル・IF（データモデルと API はこの ID と 1 対 1 で設計すること）：\n${G.ledgerIndex(project, { kinds: ['table', 'interface'], max: 8000 })}\n\n`;
+  if (stageId === 'ux') return `要件台帳の画面・帳票・機能 ID（画面定義はこの ID と 1 対 1）：\n${G.ledgerIndex(project, { kinds: ['function', 'output', 'screen', 'report'], max: 8000 })}\n\n`;
+  if (stageId === 'testing') {
+    const cv = G.coverage(project);
+    return `要件カバレッジ：台帳 ${cv.total} 件中 実装承認済み ${cv.implemented} 件・計画のみ ${cv.planned - cv.implemented} 件・未割当 ${cv.uncovered.length} 件${cv.uncovered.length ? `（未割当：${cv.uncovered.slice(0, 40).join(', ')}）` : ''}。テスト計画は ID ごとの判定とし、未実装 ID は「未検証」と明記すること。\n\n`;
+  }
+  return '';
+}
+
+/**
+ * 要件台帳の補完：ID 付きで抽出できなかった機能要件・非機能要件だけを FR-/NFR- 番号で追加する（1 回の呼び出し）。
+ * 抽出済み ID の書き換えはしない（決定的に取れるものは LLM に任せない）。
+ */
+export async function ledgerSupplement(project, scanned) {
+  const counts = {};
+  for (const it of scanned) counts[it.kind] = (counts[it.kind] || 0) + 1;
+  const sys = '你是业务分析师，负责补全需求台账。你只输出 JSON。';
+  const user =
+`项目：${project.name}
+概要：${project.brief || '（未指定）'}
+${inputsBrief(project, 12000, 2400)}
+已从输入资料全文中机械抽取的 ID：${Object.entries(counts).map(([k, n]) => `${k} ${n} 件`).join('、') || 'なし'}（例：${scanned.slice(0, 30).map(it => it.id).join(', ')}）
+
+请只补充**没有 ID 的**机能要件与非机能要件（稼働時間・RPO・性能・セキュリティ・移行・外部連携など），不要重复上面已有 ID 的内容。
+最多 40 条。只输出 JSON：
+{"items":[{"id":"FR-001","kind":"requirement","name":"…（40 字以内）","source":"根拠となる資料名"},{"id":"NFR-001","kind":"nfr","name":"…","source":"…"}]}`;
+  const { text, usage, model } = await chat(
+    [{ role: 'system', content: sys }, { role: 'user', content: user }],
+    { json: true, maxTokens: 6000, project, stageId: 'requirements' },
+  );
+  const out = parseJSON(text, 'Ledger supplement');
+  const seen = new Set(scanned.map(it => it.id));
+  const items = (Array.isArray(out.items) ? out.items : []).slice(0, 40).map((it, i) => {
+    const kind = it.kind === 'nfr' ? 'nfr' : 'requirement';
+    let id = String(it.id || '').trim().toUpperCase();
+    if (!/^(FR|NFR)-\d{2,4}$/.test(id) || seen.has(id)) id = `${kind === 'nfr' ? 'NFR' : 'FR'}-${String(900 + i).padStart(3, '0')}`;
+    seen.add(id);
+    return { id, kind, name: String(it.name || '').slice(0, 40), parent: null, refs: 0, sources: it.source ? [{ file: String(it.source).slice(0, 60), line: 0 }] : [], origin: 'model' };
+  });
+  return { items, usage, model };
+}
+
 export async function stageArtifacts(project, stage, feedback, onProgress) {
   const specs = artifactSpec(stage.id);
   const names = specs.map(s => s[1]);
   const artifacts = [];
   let usage = null, model = null;
+  const led = ledgerExtra(project, stage.id);
   for (let i = 0; i < specs.length; i++) {
-    const extra = (stage.id === 'architecture' && specs[i][0] === 'ARC-01') ? LAYOUT_RULE : '';
+    const extra = led + ((stage.id === 'architecture' && specs[i][0] === 'ARC-01') ? LAYOUT_RULE : '') + (stage.id === 'ux' ? UX_RULE : '');
     const r = await oneArtifact(project, stage, specs[i], feedback, names, extra);
     artifacts.push(r.artifact);
     usage = r.usage || usage; model = r.model || model;
@@ -407,33 +486,42 @@ export async function wbs(project) {
   const stack = (project.arch && project.arch.stack) || project.tech || '（未指定）';
   const profile = profileOf(stack);
   const sys = '你是任务规划师，负责把软件需求拆成可独立开发、可単体テスト的模块。你只输出 JSON。';
+  // 要件台帳がある = 機能 ID 単位の縦割りスライスに切る（規模に応じて Epic 数を増やす）。無ければ従来どおり 4–7 Epic。
+  const funcs = G.ledgerItems(project).filter(it => it.kind === 'function' || it.kind === 'requirement').length;
+  const maxEpics = funcs > 14 ? Math.min(60, Math.ceil(funcs / 2)) : 7;
+  const minEpics = funcs > 14 ? Math.min(maxEpics, Math.max(8, Math.ceil(funcs / 4))) : 4;
+  const ledger = G.ledgerIndex(project, { max: 14000 });
   const user =
 `项目：${project.name}
 概要：${project.brief || '（未指定）'}
 技術スタック：${stack}
 ${inputsBrief(project)}${skillsBrief(project, 'wbs')}架构已定的源码レイヤーディレクトリ（一个 Epic 一个模块，源码就落在它所属的レイヤーディレクトリ下）：${layers.join(' / ')}
-
-把项目拆成 4–7 个 Epic，每个 Epic 2–4 个 Task。每个 Epic 之后会作为一个开发模块，由工程师写代码 + 単体テスト。
+${ledger ? `\n要件台帳（入力資料の全文から抽出した ID。WBS はこの ID で追跡される。ID\t種別\t名称）：\n${ledger}\n` : ''}
+把项目拆成 ${minEpics}–${maxEpics} 个 Epic，每个 Epic 2–4 个 Task。每个 Epic 之后会作为一个开发模块，由工程师写代码 + 単体テスト。
 要求：
 1. 每个 Epic 必须带 layer，值只能取上面列出的层之一（决定源码落到哪一レイヤーディレクトリ）。
 2. Task 要小到能用一个模块实现并写单测；files 写成 ${defaultFiles(layers, 0, profile, '基础框架')}。
-3. 只输出 JSON：
-{"epics":[{"name":"基础框架","layer":"${layers[0]}","goal":"一句话目標","tasks":[{"name":"任务名","files":"${defaultFiles(layers, 0, profile, '基础框架')}","acceptance":"可机器判定的受入基準"}]}]}`;
+3. 每个 Epic 必须带 deps：它依赖的**前面** Epic 的编号（"E1" 形式，从 1 开始，按输出顺序）。Epic 按依赖顺序排列（マスタ → 台帳 → 業務処理 → 締め → 帳票），被依赖的放前面；没有依赖就给 []。
+${ledger ? `4. 按「縦割りスライス」切分：一个 Epic 对应一组相关的機能 ID（画面 → API → DB → テスト一气通贯），不要按技术层横切。每个 Epic 和 Task 必须带 req_ids（只能用上面台帳里的 ID），台帳里的每个 ID 至少被一个 Epic 覆盖；Task 的 acceptance 要写出该 ID 的業務上の判定条件（テーブル ID・項目・桁数など原文の制約）。\n` : ''}${ledger ? '5' : '4'}. 只输出 JSON：
+{"epics":[{"name":"基础框架","layer":"${layers[0]}","goal":"一句话目標","deps":[],"req_ids":[],"tasks":[{"name":"任务名","files":"${defaultFiles(layers, 0, profile, '基础框架')}","acceptance":"可机器判定的受入基準","req_ids":[]}]}]}`;
   const { text, usage, model } = await chat(
     [{ role: 'system', content: sys }, { role: 'user', content: user }],
-    { json: true, maxTokens: 4000, project, stageId: 'wbs' },
+    { json: true, maxTokens: maxEpics > 7 ? 32000 : 4000, project, stageId: 'wbs' },
   );
   const out = parseJSON(text, 'WBS');
-  const epics = (Array.isArray(out.epics) ? out.epics : []).slice(0, 8).map((e, i) => ({
+  const epics = (Array.isArray(out.epics) ? out.epics : []).slice(0, Math.max(8, maxEpics)).map((e, i) => ({
     id: `E${i + 1}`,
     name: String(e.name || `Epic ${i + 1}`).slice(0, 60),
     layer: validLayer(layers, String(e.layer || '').trim().toLowerCase()) || layerAt(layers, i),
     goal: String(e.goal || '').slice(0, 200),
+    deps: Array.isArray(e.deps) ? e.deps : undefined,          // 欠落 = governance がレイヤー順で推定
+    req_ids: G.cleanReqIds(project, e.req_ids),
     tasks: (Array.isArray(e.tasks) ? e.tasks : []).slice(0, 6).map((t, j) => ({
       id: `E${i + 1}-T${j + 1}`,
       name: String(t.name || `Task ${j + 1}`).slice(0, 80),
       files: String(t.files || defaultFiles(layers, i, profile, e.name)).slice(0, 120),
-      acceptance: String(t.acceptance || '単体テスト通过').slice(0, 200),
+      acceptance: String(t.acceptance || '単体テスト通过').slice(0, 300),
+      req_ids: G.cleanReqIds(project, t.req_ids),
       status: 'todo',
     })),
   })).filter(e => e.tasks.length);
@@ -442,6 +530,28 @@ ${inputsBrief(project)}${skillsBrief(project, 'wbs')}架构已定的源码レイ
 }
 
 /* ---------- 模块：真实生成代码 + 单测 ---------- */
+
+/** TypeScript 档案（NestJS / Next.js / PostgreSQL）：依存は許可リストから「名前だけ」要求、DB は Repository 層経由。 */
+function tsSpec(dir, testPath) {
+  const up = '../'.repeat(testPath.split('/').length - 1);
+  const allow = Object.keys(exec.npmAllow()).join(' / ');
+  return {
+    role: '你是资深 TypeScript 工程师（NestJS / Next.js / PostgreSQL），产出能被 tsx + node --test 真跑通的代码。你只输出 JSON。',
+    rules: `1. 可以用第三方包，但**只能用许可清单里的**：${allow}。本模块用到的包名写进输出 JSON 的 "deps"（只写包名，版本由平台固定）；package.json / tsconfig.json / npm install 由平台负责，**不要输出 package.json**。清单外的包不会被安装，import 会直接失败、模块判失败。
+2. 数据库访问一律经过 Repository 层：先定义接口（如 \`export interface OrderRepository { findById(id: string): Promise<Order | null> }\`），同时提供 \`InMemoryOrderRepository\`（単体テスト用）与用 \`pg\` Pool 实现的 \`PgOrderRepository\`（参数化 SQL \`$1\`，禁止拼接字符串）；Service / Controller 只依赖接口、经构造函数注入，不直接 import pg。NestJS 的 @Injectable / @Controller 可以用，用装饰器的文件首行 \`import 'reflect-metadata';\`；非类 token 用 \`@Inject(TOKEN)\`。Next.js 页面组件只做展示，把可测逻辑抽成同层 .ts 纯函数。
+3. 时间、随机数、ID 由参数/构造函数注入（不要 Date.now / Math.random）；模块为 CommonJS 解析：相对 import **不写扩展名**（\`from '${up}${dir}/order-service'\`）。`,
+    files: `源码只能放 ${dir}/ 下的 .ts（React 组件可用 .tsx；架构规约指定的レイヤーディレクトリ，不许改到别处）；**不许建模块子目录**，文件名用业务语义的 kebab-case（如 order-service.ts、order-repository.ts），**不要带 WBS 模块号/任务号**`,
+    test: `単体テスト放 ${testPath}，用 node:test（执行侧是 \`node --import tsx --test ${testPath}\`）：
+import { test } from 'node:test'; import assert from 'node:assert/strict';
+import { OrderService } from '${up}${dir}/order-service';
+単体テストは InMemory リポジトリを直接 new して注入する（Nest の DI コンテナや本物の DB に依存しない）。
+本物の PostgreSQL が要る統合ケースは必ずこの形にする（平台は Docker があれば postgres:16 を起動して DATABASE_URL を渡し、無ければ skipped として記録し合格扱いにしない）：
+test('PgOrderRepository 往復', { skip: !process.env.DATABASE_URL && 'PostgreSQL unavailable' }, async () => {
+  const { Pool } = await import('pg'); const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  try { await pool.query('CREATE TABLE IF NOT EXISTS ...'); /* 断言 */ } finally { await pool.end(); }
+});`,
+  };
+}
 
 function langSpec(profile, dir, testPath) {
   const testClass = testPath.split('/').pop().replace(/\.[a-z]+$/, '');
@@ -481,6 +591,7 @@ class TestX(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()`,
   };
+  if (profile.deps) return tsSpec(dir, testPath);
   return {
     role: '你是资深 Node.js 工程师，产出可运行、可测试的 ES Module 代码。你只输出 JSON。',
     rules: `1. 只允许 Node 内置模块与纯函数；**禁止引入任何第三方包**（pg / express / axios / dotenv / uuid 等一律不要——它们没安装，import 会直接报 ERR_MODULE_NOT_FOUND）。需要存储/状态就用内存对象或纯数据结构模拟。
@@ -492,6 +603,55 @@ import { test } from 'node:test'; import assert from 'node:assert/strict';
   };
 }
 
+/**
+ * モジュール用コンテキストパック：上流の要約ではなく、
+ *  ① 担当する要件 ID の原文行（入力資料の該当箇所 ±2 行）
+ *  ② 依存モジュールの実ソース（mock せず import して使うため）
+ * をそれぞれ上限付きで渡す。
+ */
+export function moduleContext(project, mod, { reqCap = 6000, depCap = 8000 } = {}) {
+  const parts = [];
+  const items = G.ledgerItems(project).filter(it => (mod.req_ids || []).includes(it.id) || (it.parent && (mod.req_ids || []).includes(it.parent)));
+  if (items.length) {
+    const root = exec.wsDir(project.id);
+    const cache = new Map();
+    const lines = (file) => {
+      if (!cache.has(file)) { let t = ''; try { t = fs.readFileSync(`${root}/inputs/${file}`, 'utf8'); } catch {} cache.set(file, t.split(/\r?\n/)); }
+      return cache.get(file);
+    };
+    let used = 0; const out = [];
+    for (const it of items) {
+      const src = (it.sources || []).slice(0, 2).map(s => {
+        const ls = lines(s.file); if (!ls.length) return '';
+        return `  〔${s.file}:${s.line}〕\n` + ls.slice(Math.max(0, s.line - 3), s.line + 2).map(l => `    ${l.slice(0, 200)}`).join('\n');
+      }).filter(Boolean).join('\n');
+      const block = `- ${it.id}（${it.kind}）${it.name || ''}\n${src}`;
+      if (used + block.length > reqCap) { out.push(`- …（残り ${items.length - out.length} 件は ID のみ：${items.slice(out.length).map(x => x.id).join(', ')}）`); break; }
+      out.push(block); used += block.length;
+    }
+    parts.push(`\n本模块负责的要件 ID（原文抜粋。業務ルール・桁数・コード値は原文どおりに実装し、単体テストで検証すること）：\n${out.join('\n')}\n`);
+  }
+  const deps = (mod.deps || []).map(id => (project.modules || []).find(m => m.id === id)).filter(Boolean);
+  if (deps.length) {
+    const root = exec.wsDir(project.id);
+    let used = 0; const out = [];
+    for (const d of deps) {
+      for (const f of (d.files || []).filter(f => f.path !== d.test_path)) {
+        let body = ''; try { body = fs.readFileSync(`${root}/${f.path}`, 'utf8'); } catch { continue; }
+        const block = `--- ${d.id} ${d.name}：${f.path} ---\n${body.slice(0, 2500)}`;
+        if (used + block.length > depCap) { out.push(`--- （${f.path} ほかは省略：パスだけ参照可）`); break; }
+        out.push(block); used += block.length;
+      }
+    }
+    parts.push(`\n依存モジュール（承認済みの実コード。**同じ機能を再実装・mock せず、相対パスで import して使う**）：${deps.map(d => `${d.id} ${d.name}`).join('、')}\n${out.join('\n')}\n`);
+  }
+  // 疑問・変更台帳の回答済み決定事項：担当 ID が重なるもの・自分が出したものは必ず従う（再質問しない）
+  const mine = new Set(mod.req_ids || []);
+  const decided = G.questionsOf(project).filter(q => q.status === 'answered' && (q.module === mod.id || (q.req_ids || []).some(id => mine.has(id))));
+  if (decided.length) parts.push(`\n確定した仕様判断（疑問・変更台帳。原文より優先し、同じ疑問を再度出さない）：\n${decided.map(q => `- ${q.id} [${(q.req_ids || []).join(', ')}] Q：${q.text}\n  A（${q.answered_by}）：${q.answer}`).join('\n')}\n`);
+  return parts.join('');
+}
+
 export async function moduleCode(project, mod, feedback) {
   const stack = (project.arch && project.arch.stack) || project.tech || 'Node.js';
   const profile = profileOf(stack);
@@ -501,6 +661,7 @@ export async function moduleCode(project, mod, feedback) {
   const spec = langSpec(profile, dir, testPath);
   const cds = profile.cds ? `\n8. 本项目是 SAP CAP：本模块若涉及Data models或服务定义，必须同时产出真实 CDS 文件（db/schema.cds、srv/<名>-service.cds）：namespace + entity（**每个实体必须有 key**）+ service/projection；不要用 Java 注解或任何 ORM 替代 CDS 建模。` : '';
   const exFile = profile.ext;
+  const ctx = moduleContext(project, mod);
   const sys = spec.role;
   const user =
 `项目：${project.name}（技術スタック：${stack} → 言語プロファイル：${profile.label}）
@@ -509,16 +670,17 @@ export async function moduleCode(project, mod, feedback) {
 模块目標：${mod.goal || '（未给出）'}
 任务清单：
 ${tasks.map(t => `- ${t.name}${t.acceptance ? `（验收：${t.acceptance}）` : ''}`).join('\n') || '- （无）'}
-${feedback ? `\n上一轮被驳回的意见（必须修正）：〔${feedback.category}〕${feedback.comment}\n` : ''}${skillsBrief(project, 'development')}
+${ctx}${feedback ? `\n上一轮被驳回的意见（必须修正）：〔${feedback.category}〕${feedback.comment}\n` : ''}${skillsBrief(project, 'development')}
 硬性要求：
 ${spec.rules}
 4. ${spec.files}；単体テスト放 ${testPath}。
 5. ${spec.test}
 6. 每files ≤ 150 行；被测函数要导出（Java 用 public static）。
 7. 単体テスト要确实覆盖任务清单里的行为，断言要具体（断言值，不要只 check("ok", true) / assert.ok(x)）。${cds}
-9. 只输出 JSON：
-{"summary":"本模块实现了什么","files":[{"path":"${dir}/<业务文件名>${exFile}","content":"..."}],"test":{"path":"${testPath}","content":"..."}}`;
-  const budget = profile.id === 'java' || profile.id === 'cap-java' ? 24000 : 8000;
+9. 原文に無い・矛盾する・解釈が分かれる業務ルール（端数処理、境界値、コード値、例外時の扱いなど）は**推測で決めず** questions に挙げる（関係する要件 ID 付き、1 件 1 論点、最大 5 件）。それでも files / test は現時点の最善の草稿として出す（人の回答後に作り直す）。疑問が無ければ questions は [] にする。
+10. 只输出 JSON：
+{"summary":"本模块实现了什么","files":[{"path":"${dir}/<业务文件名>${exFile}","content":"..."}],"test":{"path":"${testPath}","content":"..."},"questions":[{"req_ids":["<要件 ID>"],"text":"<人に確認したいこと>"}]${profile.deps ? ',"deps":["<许可清单内的包名>"]' : ''}}`;
+  const budget = profile.id === 'java' || profile.id === 'cap-java' ? 24000 : profile.deps ? 16000 : 8000;
   let out = null, usage = null, model = null, text = '';
   for (let attempt = 1; attempt <= 2; attempt++) {
     const retryNote = attempt === 1 ? '' : `\n\n上一次返回不合格：${!out ? 'JSON 解析失败' : (!(out.files || []).length ? 'files 为空' : '缺少 test 字段（必须是 {path, content}）')}。这次务必带上 test，且保证 JSON 完整：必要时减少源码文件数、精简每段代码，宁可少而全，不要多而缺。`;
@@ -536,5 +698,51 @@ ${spec.rules}
   const shape = ` (fields: ${Object.keys(out || {}).join(', ') || 'none'}; files=${files.length}${test ? '' : '; test is missing or is not {path,content}'}; ${text.length} characters)`;
   if (!files.length) throw new ProviderError(`Module ${mod.id}: model returned no source files${shape}`);
   if (!test) throw new ProviderError(`Module ${mod.id}: model returned no unit test${shape}`);
-  return { summary: String(out.summary || '').slice(0, 300), files, test, usage, model, profile: profile.id };
+  const questions = Array.isArray(out.questions) ? out.questions : [];
+  const deps = profile.deps && Array.isArray(out.deps) ? out.deps.map(String).slice(0, 20) : [];
+  return { summary: String(out.summary || '').slice(0, 300), files, test, questions, deps, usage, model, profile: profile.id };
+}
+
+/* ---------- UX：デザインシステム（1 回）と重要画面のハイファイ内容（画面ごと） ---------- */
+
+/** 共通テンプレートのトークンとファンクションキー割当を 1 回だけ決める。HTML 自体はプラットフォームのテンプレートで組む（壊れた HTML を出させない）。 */
+export async function uxDesign(project) {
+  const sys = '你是业务系统的 UX 设计师，负责为整个系统定一套设计系统（共通テンプレート）。你只输出 JSON。';
+  const user =
+`项目：${project.name}
+概要：${project.brief || '（未指定）'}
+${inputsBrief(project, 6000, 1500)}${skillsBrief(project, 'ux')}
+请为该业务系统（现行是检索条件 + 一览 + 明细 + ファンクションキー的端末画面）决定共通テンプレートのトークン与ファンクションキー割当。
+只输出 JSON：
+{"system":"システム名（20 字以内）","tokens":{"brand":"#0b5394","ink":"#1f2328","muted":"#5b6470","line":"#c9d1da","panel":"#f4f6f9","accent":"#0b7a3e","danger":"#b42318","density":"compact"},
+ "fkeys":[{"key":"F1","label":"ヘルプ"},{"key":"F2","label":"検索"},{"key":"F5","label":"登録"},{"key":"F12","label":"終了"}]}
+约束：F2=検索・F5=登録・F12=終了 必须保留；label 6 字以内；颜色必须 #hex，需满足文字对比度 4.5:1。`;
+  const { text, usage, model } = await chat([{ role: 'system', content: sys }, { role: 'user', content: user }], { json: true, maxTokens: 1200, project, stageId: 'ux' });
+  const out = parseJSON(text, 'UX design system');
+  return { system: String(out.system || project.name).slice(0, 20), tokens: out.tokens || {}, fkeys: out.fkeys || [], usage, model };
+}
+
+/** 重要画面 1 枚のハイファイ内容。項目は現行資料から抽出済み（base）を出発点に、並び・初期値・メッセージ・注記を詰める。 */
+export async function uxScreen(project, scr, asis, base) {
+  const sys = '你是业务系统的 UX 设计师，正在把一张现行画面做成高保真原型（供职员做可用性测试）。你只输出 JSON。';
+  const user =
+`项目：${project.name}
+画面 ID：${scr.id}　画面名：${scr.name || '（不明）'}　種別：${scr.form === 'report' ? '帳票' : '画面'}
+現行資料（${asis.file || 'なし'}）：
+${String(asis.text || '（現行資料に記載なし）').slice(0, 3500)}
+
+从现行资料抽取的项目（出発点，不得遗漏）：
+${JSON.stringify({ search: base.search, columns: base.columns, detail: base.detail }).slice(0, 4000)}
+
+请输出这一画面的高保真内容。只输出 JSON：
+{"search":[{"label":"…","type":"text|number|date|check","len":10,"note":"…"}],"columns":[…同形…],"detail":[…同形…],"rows":8,"message":"画面下部のガイダンス（40 字以内）","notes":["状態：0 件時は…","権限なし時は…"]}
+约束：现行项目全部保留（可改顺序、可补充）；label 24 字以内；notes 最多 5 条。`;
+  const { text, usage, model } = await chat([{ role: 'system', content: sys }, { role: 'user', content: user }], { json: true, maxTokens: 3000, project, stageId: 'ux' });
+  const out = parseJSON(text, `UX screen ${scr.id}`);
+  const fields = (a, fb) => (Array.isArray(a) && a.length ? a : fb).slice(0, 40).map(f => ({ label: String(f.label || '').slice(0, 24), type: ['text', 'number', 'date', 'check'].includes(f.type) ? f.type : 'text', len: Number(f.len) || null, note: String(f.note || '').slice(0, 60) })).filter(f => f.label);
+  return {
+    search: fields(out.search, base.search), columns: fields(out.columns, base.columns), detail: fields(out.detail, base.detail),
+    rows: Number(out.rows) || 8, message: String(out.message || '').slice(0, 60),
+    notes: (Array.isArray(out.notes) ? out.notes : []).slice(0, 5).map(n => String(n).slice(0, 80)), usage, model,
+  };
 }

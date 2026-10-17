@@ -414,6 +414,15 @@ body {
 .tnode:not(.sel).s-awaiting_review { box-shadow: inset 2px 0 0 var(--warn); }
 .tnode:not(.sel).s-approved { box-shadow: inset 2px 0 0 var(--ok); }
 .tnode:not(.sel).s-failed, .tnode:not(.sel).s-rejected { box-shadow: inset 2px 0 0 var(--fail); }
+/* 疑問で保留中：承認待ちと同じ警告色の中抜き（人の回答待ち） */
+.tnode .dot.s-on_hold, .legend .dot.s-on_hold { background: transparent; box-shadow: inset 0 0 0 2px var(--warn); }
+.tnode:not(.sel).s-on_hold { box-shadow: inset 2px 0 0 var(--warn); }
+.qa { display: grid; gap: 6px; padding: 12px 14px; border-top: 1px solid var(--line); }
+.qa:first-child { border-top: 0; }
+.qa .qh { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.qa .qt { white-space: pre-wrap; }
+.qa textarea.field { min-height: 56px; }
+.qa .acts { display: flex; gap: 6px; flex-wrap: wrap; }
 .tnode .dot.live, .legend .dot.live { animation: pulse 1.1s ease-in-out infinite; }
 .legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
 .legend .lg { display: inline-flex; align-items: center; gap: 6px; font: 400 11px/1 var(--font-ui); color: var(--muted); }
@@ -840,3 +849,24 @@ label.lb { display:block; font:500 10px/1 var(--font-mono); letter-spacing:.1em;
 .set-default select { font: 400 12px/1.5 var(--font-mono); }
 .set-warn { background: var(--warn-dim); border: 1px solid var(--warn); color: var(--ink); padding: 10px 14px; border-radius: var(--radius-lg); margin-bottom: var(--gap); font: 400 12px/1.5 var(--font-ui); }
 .set-warn.danger { background: var(--fail-dim); border-color: var(--fail); }
+
+/* ---------- UX：画面プロトタイプ（html / image 成果物・ギャラリー・AS-IS/TO-BE 比較） ---------- */
+.proto-wrap { border: 1px solid var(--line); background: #fff; overflow: auto; }
+iframe.proto { display: block; width: 1290px; max-width: none; height: 70vh; min-height: 480px; border: 0; background: #fff; }
+.proto-shot { margin-top: 12px; }
+.proto-shot img, .art-img img { display: block; max-width: 100%; border: 1px solid var(--line); background: #fff; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 10px; max-height: 62vh; overflow: auto; padding: 2px; }
+.gcard { display: flex; flex-direction: column; gap: 4px; padding: 6px; text-align: left; font: inherit; color: inherit; cursor: pointer; background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px; }
+.gcard:hover { border-color: var(--ink-2); }
+.gcard.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.gcard .thumb { aspect-ratio: 16 / 10; overflow: hidden; background: #fff; border: 1px solid var(--line); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; color: #555; }
+.gcard .thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top left; }
+.gcard .gmeta { display: flex; justify-content: space-between; align-items: center; gap: 4px; font-size: 11px; }
+.gcard .gname { font-size: 11px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ux-compare { margin-top: 14px; }
+.stage-gallery { padding: 10px 14px; border-top: 1px solid var(--line); }
+.stage-gallery .gallery { max-height: 340px; }
+.cmp { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+.cmp pre.asis { margin: 0 0 4px; max-height: 70vh; overflow: auto; font: 400 11px/1.45 var(--font-mono); background: var(--panel-2); border: 1px solid var(--line); padding: 8px; white-space: pre; }
+.cmp img.tobe, .cmp img.asis-img { display: block; width: 100%; border: 1px solid var(--line); background: #fff; margin-bottom: 6px; }
+@media (max-width: 1100px) { .cmp { grid-template-columns: 1fr; } }

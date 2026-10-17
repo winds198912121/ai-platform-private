@@ -20,7 +20,8 @@ let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; console.log(`  PASS  ${msg}`); } else { fail++; console.log(`  FAIL  ${msg}`); } };
 
 const get = async (u) => { const r = await fetch(BASE + u); return { status: r.status, body: await r.json() }; };
-const post = async (u, b) => { const r = await fetch(BASE + u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b || {}) }); return { status: r.status, body: await r.json() }; };
+// 承認は画面のボタン操作の代役（人のテスター）なので dashboard ヘッダを付ける
+const post = async (u, b) => { const r = await fetch(BASE + u, { method: 'POST', headers: { 'content-type': 'application/json', ...(/\/approve$/.test(u) ? { 'x-approval-source': 'dashboard' } : {}) }, body: JSON.stringify(b || {}) }); return { status: r.status, body: await r.json() }; };
 const put = async (u, b) => { const r = await fetch(BASE + u, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b || {}) }); return { status: r.status, body: await r.json() }; };
 const del = async (u) => { const r = await fetch(BASE + u, { method: 'DELETE' }); return { status: r.status, body: await r.json() }; };
 const waitFor = async (fn, ms = 20000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, 60)); } throw new Error('等待超时'); };

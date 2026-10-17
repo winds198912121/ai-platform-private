@@ -49,7 +49,7 @@
 ## 3 如何验证（实测命令与结果）
 
 ```bash
-cd ~/Desktop/work/pm/ai-platform
+cd ~/Developer/tools/ai-platform-workspace/ai-platform
 bash tools/run_all.sh          # 离线：单测 16 + 端到端 52，FAIL=0
 bash tools/run_all.sh --live   # 追加真实模型端到端 30，FAIL=0
 ```

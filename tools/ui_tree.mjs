@@ -52,7 +52,8 @@ const server = spawn(process.execPath, [path.join(DIR, 'server.mjs')], {
 });
 await waitFor(async () => { try { return (await fetch(BASE + '/api/state')).ok; } catch { return false; } }, 20000, '服务就绪');
 
-const post = async (u, b) => (await fetch(BASE + u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b || {}) })).json();
+// 承認は画面のボタン操作の代役（人のテスター）なので dashboard ヘッダを付ける
+const post = async (u, b) => (await fetch(BASE + u, { method: 'POST', headers: { 'content-type': 'application/json', ...(/\/approve$/.test(u) ? { 'x-approval-source': 'dashboard' } : {}) }, body: JSON.stringify(b || {}) })).json();
 const jget = async (u) => (await fetch(BASE + u)).json();
 const proj = await post('/api/projects', { name: 'UI 源码管理检查', brief: '借阅管理：借书/还书/逾期罚金。', mode: 'human_gate' });
 // 人工审批模式：放行到开发阶段，这样模块停在「待批准」→ 源码可编辑（已批准会锁定，另有专门断言）
@@ -201,7 +202,7 @@ ok(dialogs.some(d => /已保存并重跑该模块单测/.test(d)), `保存后页
 await shot('23-source-save.png');
 
 console.log('\n[6] 已批准模块锁定：界面不给改，绕过界面直接写也被服务端拒（409）');
-const ap = await fetch(`${BASE}/api/projects/${proj.id}/modules/${mod0.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reviewer: 'UI-检查' }) });
+const ap = await fetch(`${BASE}/api/projects/${proj.id}/modules/${mod0.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-approval-source': 'dashboard' }, body: JSON.stringify({ reviewer: 'UI-检查' }) });
 ok(ap.status === 200, `批准模块 ${mod0.id}（HTTP ${ap.status}）`);
 await send('Page.navigate', { url: `${BASE}/?view=code&project=${proj.id}` });
 await waitFor(async () => await ev(`document.querySelectorAll('.trow').length > 0`), 20000, '重新渲染源码树');

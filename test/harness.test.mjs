@@ -27,7 +27,8 @@ const waitFor = async (fn, ms = 3000) => {
   throw new Error('waitFor 超时');
 };
 const stage = (p, id) => p.stages.find(s => s.id === id);
-const mk = (mode = 'human_gate', name = '测试项目') => H.createProject({ name, brief: '测试用项目概要', tech: 'Node.js', mode });
+// auto のテストは「完全自動」を検証している → 高リスク段階の人待ち（既定 human_gates）を明示的に外す
+const mk = (mode = 'human_gate', name = '测试项目') => H.createProject({ name, brief: '测试用项目概要', tech: 'Node.js', mode, ...(mode === 'auto' ? { human_gates: [] } : {}) });
 
 test('项目信息可以编辑：改名称/需求/技术栈/入口模式 + 校验 + 事件留痕 + 幂等', () => {
   const p = mk('human_gate', '可编辑项目');
@@ -216,7 +217,7 @@ test('预设技能库：每个阶段都有技能，开发阶段有各技术栈�
     assert.ok(n >= 2, `阶段「${s}」有 ${n} 条专业技能（每个阶段至少 2 条）`);
   }
   const techs = cat.filter(c => c.stage === 'development' && c.tech).map(c => c.tech);
-  for (const t of ['java-springboot', 'java-struts', 'nodejs', 'sap-cap-rap', 'python', 'static', 'react-vite']) {
+  for (const t of ['java-springboot', 'java-struts', 'nodejs', 'sap-cap-rap', 'python', 'static', 'react-vite', 'nestjs-nextjs-postgres']) {
     assert.ok(techs.includes(t), `开发阶段有 ${t} 技能文件（实际 ${techs.join('、')}）`);
   }
   assert.ok(cat.filter(c => c.stage === 'development').some(c => !c.tech), '开发阶段还有通用规范');
@@ -729,7 +730,7 @@ test('产物落盘目录按「流程序号-流程名」（模块产物归到模�
 
 test('重新构建：清空全部产物与历史痕迹（阶段/WBS/架构/模块/工作区文件），技能与输入资料保留', async () => {
   const p = H.createProject({
-    name: '重新构建测试', brief: '订单管理', tech: 'Node.js', mode: 'auto',
+    name: '重新构建测试', brief: '订单管理', tech: 'Node.js', mode: 'auto', human_gates: [],
     files: [{ name: 'brief.md', content: '输入资料：逾期罚金每册每天 0.50 元' }],
   });
   H.addSkill(p, { name: '约定A', body: '只允许 Node 内置模块' });
