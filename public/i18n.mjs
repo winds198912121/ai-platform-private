@@ -342,6 +342,10 @@ const DICT = {
   'proj.rebuild.confirm': ['Rebuild project “{name}”?\n\nCleared: every stage artifact, WBS, architecture spec, modules with source/tests, run history, and generated files under workspace/{id}/.\nKept: {sk} skills, input materials, tech stack and model config. This cannot be undone.', 'プロジェクト「{name}」を再ビルドしますか？\n\n消去：全ステージの成果物、WBS、アーキテクチャ規約、モジュールとソース・テスト、実行履歴、workspace/{id}/ の生成物。\n保持：スキル {sk} 件、入力資料、技術スタックとモデル設定。元に戻せません。'],
   'proj.rebuild.force':   ['Force rebuild now?', '今すぐ強制再ビルドしますか？'],
   'proj.rebuild.title':   ['Rebuild (clears every artifact and run history, keeps skills)', '再ビルド（成果物と実行履歴を消去、スキルは保持）'],
+  'proj.run.title':       ['Run / resume the pipeline from the next pending stage', '未承認ステージからパイプラインを起動／再開'],
+  'proj.run.allDone':     ['All stages approved — nothing to run', '全ステージ承認済み — 起動できる段階はありません'],
+  'proj.run.error':       ['Failed to start: {msg}', '起動失敗: {msg}'],
+  'act.runProject':       ['▶ Run', '▶ 起動'],
 
   /* ---------- 总览 KPI ---------- */
   'kpi.progress':         ['Pipeline progress', 'パイプライン進捗'],

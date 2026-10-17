@@ -692,10 +692,12 @@ table.data .bad { color: var(--fail); font-family: var(--font-mono); }
 .btn.primary { background: #2f7d52; color: #fff; border-color: #2f7d52; }
 .btn.danger  { background: #c33c33; color: #fff; border-color: #c33c33; }
 .btn.warn    { background: var(--accent); color: #1b1206; border-color: var(--accent); }
+.btn.run     { background: #4f9dff; color: #04131f; border-color: #4f9dff; }
 .btn:disabled { opacity:.45; cursor:not-allowed; }
 .btn.primary:hover:not(:disabled),
 .btn.danger:hover:not(:disabled),
-.btn.warn:hover:not(:disabled){ filter: brightness(1.08); }
+.btn.warn:hover:not(:disabled),
+.btn.run:hover:not(:disabled)   { filter: brightness(1.08); }
 
 input.field, select.field, textarea.field {
   width:100%; background: var(--panel-2); border:1px solid var(--line-2); color: var(--ink);

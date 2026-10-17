@@ -894,6 +894,20 @@ export function rescanLedger(id, { replace = true } = {}) {
   return { items: items.length, scanned, dropped: dropped.length, added: added.length, prev_count: prevIds.size };
 }
 
+/** Resumable launcher for the project card 「起動」 button:
+ *  finds the first non-approved stage and runs it via the existing kick machinery.
+ *  Returns { stage_id, stage_name } on success, throws 409 if there's nothing to run
+ *  (all approved) or a stage is currently busy / awaiting review.
+ */
+export function runProject(id) {
+  const p = must(id);
+  const st = currentStage(p);
+  if (!st) throw new HttpError(409, 'All stages already approved — nothing to run');
+  const r = checkStageRunnable(p, st.id);
+  guarded(p.id, () => runStage(p, r.id));
+  return { stage_id: r.id, stage_name: r.name };
+}
+
 /* ---------- execute器 ---------- */
 
 async function guarded(id, fn) {

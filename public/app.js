@@ -324,6 +324,9 @@ const VIEWS = {
         </div>` : '';
     const cards = DB.projects.map(p => {
       const s = summary(p);
+      const runnable = !s.done || s.done < s.total;
+      const running = !!(s.cur && s.cur.status === 'running');
+      const runBtnTitle = runnable ? t('proj.run.title') : t('proj.run.allDone');
       const body = `
         <div class="pname" title="${esc(p.brief || '')}">${esc(p.name)}</div>
         <div class="progress"><i class="${s.done === s.total ? 'ok' : 'acc'}" style="width:${Math.round(s.progress * 100)}%"></i></div>
@@ -336,6 +339,7 @@ const VIEWS = {
         ${body}
         <div class="card-acts">
           <button class="btn" type="button" data-edit-project="${esc(p.id)}">${esc(t('act.edit'))}</button>
+          <button class="btn run" data-run-project="${esc(p.id)}" title="${esc(runBtnTitle)}"${runnable && !running ? '' : ' disabled'}>${esc(t('act.runProject'))}</button>
           <button class="btn warn" data-rebuild-project="${esc(p.id)}" title="${esc(t('proj.rebuild.title'))}">${esc(t('act.rebuild'))}</button>
           <button class="btn danger" data-del-project="${esc(p.id)}" title="${esc(t('proj.del.title'))}">${esc(t('act.delete'))}</button>
         </div>
@@ -1368,6 +1372,19 @@ document.addEventListener('click', (e) => {
     return render(true);
   }
   if (el('[data-cancel-edit]')) { PEDIT = null; return render(true); }
+
+  const rn = el('[data-run-project]');
+  if (rn) {
+    const id = rn.dataset.runProject;
+    return act(async () => {
+      try {
+        const r = await api.post(`/api/projects/${id}/run`, {});
+        alert(`${t('act.runProject')} → ${r.stage_name}`);
+      } catch (e) {
+        alert(t('proj.run.error', { msg: e.message }));
+      }
+    });
+  }
 
   const rb = el('[data-rebuild-project]');
   if (rb) {
