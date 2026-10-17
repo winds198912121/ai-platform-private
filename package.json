@@ -6,6 +6,7 @@
   "description": "A local AI development platform with visual workflows, human review, code generation, and test execution.",
   "scripts": {
     "start": "node server.mjs",
+    "start:open": "node tools/launch.mjs",
     "test": "AI_PLATFORM_SPEED=0 node --test test/",
     "e2e": "node tools/e2e.mjs",
     "verify": "bash tools/run_all.sh"

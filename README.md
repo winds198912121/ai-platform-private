@@ -71,6 +71,16 @@ git clone https://github.com/winds198912121/ai-platform-private.git ai-platform
 cd ai-platform
 ```
 
+### One-click launch
+
+Double-click `Launch AI Platform.command` in the project root (macOS Finder). It checks whether the server is already running, starts it if needed, waits for HTTP 200, then opens <http://127.0.0.1:8788> in the default browser. Equivalent commands for any platform:
+
+```bash
+npm run start:open        # cross-platform: launch.mjs — pidfile + browser open + friendly log
+bash setup/install.sh start     # daemon-style, no browser
+node server.mjs                 # foreground, the original command
+```
+
 ### Run with a model
 
 ```bash
