@@ -1569,7 +1569,12 @@ function syncDevelopment(p) {
 export async function reverifyApprovedModules(p, changed, opts = {}) {
   const root = exec.wsDir(p.id);
   const broken = [];
+  // 影響範囲を「実際に書き換えたファイル」に限定する。同層でも別ファイルなら再検証しない
+  // （以前はレイヤー単位で再検証していたため、無関係なモジュールまで打ち戻されて永久に振動した）。
+  const changedPaths = new Set((changed.files || []).map(f => f.path));
   for (const other of (p.modules || []).filter(m => m !== changed && m.status === 'approved' && m.test_path)) {
+    const overlap = (other.files || []).some(f => changedPaths.has(f.path));
+    if (!overlap) continue;
     const rel = exec.safeRel(other.test_path);
     if (!rel || !fs.existsSync(path.join(root, rel))) continue;
     const tr = await exec.runTests(root, rel, prof(p), (other.files || []).map(f => f.path));
@@ -1651,9 +1656,11 @@ export function approveModule(p, moduleId, reviewer = 'Human', { source = 'direc
 export function rejectModule(p, moduleId, { category = 'Uncategorized', comment = '', reviewer = 'Human' } = {}) {
   const mod = p.modules.find(m => m.id === moduleId);
   if (!mod) throw new HttpError(404, 'Module not found');
-  if (mod.status !== 'awaiting_review' && mod.status !== 'approved') throw new HttpError(409, `module current status is "${mod.status}" — cannot reject`);
+  // failed も人から差し戻せる（自動再試行の上限 3 回に達した後の救済路）。
+  if (!['awaiting_review', 'approved', 'failed'].includes(mod.status)) throw new HttpError(409, `module current status is "${mod.status}" — cannot reject`);
   const wasApproved = mod.status === 'approved';               // 已批准也能撤回重做：后来发现它把同层别's module写坏了是常事
-  mod.status = 'rejected'; mod.version += 1; mod.attempts = wasApproved ? 0 : mod.attempts;   // 人给的机会不计入自动retry的 3 轮
+  const wasFailed = mod.status === 'failed';
+  mod.status = 'rejected'; mod.version += 1; mod.attempts = (wasApproved || wasFailed) ? 0 : mod.attempts;   // 人给的机会不计入自动retry的 3 轮
   mod.review = { decision: 'rejected', by: reviewer, at: now(), category, comment };
   pushEvent(p, { stage: 'development', kind: 'gate', text: `✕ module ${mod.id}"${mod.name}"${wasApproved ? '(approved → retracted)' : ''}rejected [${category}]${comment ? '：' + comment : ''} → feedback fed to model, retrying` });
   if (String(comment).trim()) draftLesson(p, { from: 'rejection', ref: mod.id, stage: 'development', draft: G.lessonDraft({ kind: 'rejection', category, comment, module: mod.id, name: mod.name }) });

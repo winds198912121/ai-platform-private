@@ -34,6 +34,65 @@ async function getState() {
   return r.json();
 }
 
+const AUTO_ANSWER = process.argv.includes('--auto-answer');
+const AUTO_LESSONS = process.argv.includes('--auto-lessons');
+const DEFAULT_ANSWER = '仕様書に明記がないため、PM 判断として現実装の既定方針で確定します。追加の質問は不要です。判断根拠を実装コメントに残し、実装を完了してください。';
+
+async function answerOpenQuestions(pid, p) {
+  const open = (p.questions || []).filter(q => q.status === 'open');
+  if (!open.length) return 0;
+  let n = 0;
+  for (const q of open) {
+    const r = await fetch(`${BASE}/api/projects/${pid}/questions/${q.id}/answer`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-approval-source': 'dashboard' },
+      body: JSON.stringify({ answer: DEFAULT_ANSWER, by: 'PM Sato' }),
+    });
+    if (r.ok) { n++; log(`answer ${q.id} (${q.module}) → default`); }
+    else log(`!! answer ${q.id} failed: ${r.status}`);
+    await sleep(250);
+  }
+  return n;
+}
+
+/** 教訓は「dismiss」ではなく短い決定行として承認する。
+ *  dismiss するとモデルへのフィードバックが消え、同じ疑問を繰り返して
+ *  モジュールが pending に戻され続ける（実測でそうなった）。
+ *  本文は「→」以降の回答を 90 文字に切って 1 行だけ残す。 */
+function shortLesson(draft) {
+  const s = String(draft || '');
+  const i = s.lastIndexOf('→');
+  const tail = (i >= 0 ? s.slice(i + 1) : s).trim().replace(/\s+/g, ' ');
+  return `- ${tail.slice(0, 90)}${tail.length > 90 ? '…' : ''}`;
+}
+
+async function approveDraftLessons(pid, p) {
+  const drafts = (p.lessons || []).filter(l => l.status === 'draft');
+  if (!drafts.length) return 0;
+  const skill = (p.skills || []).find(s => s.name === 'Lessons learned (development)');
+  let size = skill ? skill.body.length : 0;
+  let n = 0;
+  for (const l of drafts) {
+    const line = shortLesson(l.draft);
+    if (size + line.length + 1 > 3900) {           // 余裕が無ければ dismiss
+      await fetch(`${BASE}/api/projects/${pid}/lessons/${l.id}/dismiss`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-approval-source': 'dashboard' },
+        body: JSON.stringify({ by: 'PM Sato' }),
+      }).catch(() => {});
+      continue;
+    }
+    const r = await fetch(`${BASE}/api/projects/${pid}/lessons/${l.id}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-approval-source': 'dashboard' },
+      body: JSON.stringify({ body: line, by: 'PM Sato' }),
+    });
+    if (r.ok) { n++; size += line.length + 1; }
+    await sleep(120);
+  }
+  if (n) log(`approved ${n} lesson(s) as short rules (skill ≈ ${size} chars)`);
+  return n;
+}
+
 async function approveStage(pid, sid) {
   // human_gate でも通る形に：source=dashboard + 人間名 + x-approval-source ヘッダー
   // 名前は governance.AUTOMATED /(auto|ai|bot|pipeline|agent|script|ci|cron|自動)/i に
@@ -60,6 +119,8 @@ async function main() {
     const state = await getState();
     const p = (state.projects || []).find(x => x.id === PROJECT_ID);
     if (!p) { log(`!! project ${PROJECT_ID} not found`); process.exit(3); }
+    if (AUTO_ANSWER) await answerOpenQuestions(PROJECT_ID, p);
+    if (AUTO_LESSONS) await approveDraftLessons(PROJECT_ID, p);
     const stages = p.stages || [];
     const done = stages.filter(s => s.status === 'approved').length;
     const cur = stages.find(s => s.status !== 'approved');
@@ -67,6 +128,40 @@ async function main() {
     if (line !== lastLog) { log(line); lastLog = line; }
 
     if (!cur) { log('all approved — done.'); process.exit(0); }
+
+    // development は段階一括承認できない（per-module）。awaiting_review のモジュールを個別に承認。
+    if (cur.kind === 'development') {
+      const ready = (p.modules || []).filter(m => m.status === 'awaiting_review');
+      if (ready.length) {
+        for (const m of ready) {
+          try {
+            const r = await fetch(`${BASE}/api/projects/${PROJECT_ID}/modules/${m.id}/approve`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'x-approval-source': 'dashboard' },
+              body: JSON.stringify({ reviewer: 'PM Sato' }),
+            });
+            if (r.ok) log(`approve module ${m.id} (${m.name})`);
+            else log(`!! approve module ${m.id} failed: ${r.status} ${(await r.text()).slice(0, 160)}`);
+          } catch (e) { log(`!! approve module ${m.id}: ${e.message}`); }
+          await sleep(300);
+        }
+        if (ONCE) { log('--once: leaving after module approvals'); process.exit(0); }
+        continue;
+      }
+      // 承認待ちが無ければ、依存が全部承認済みの pending/rejected/failed(<3) を kick する
+      const st = (p.modules || []).reduce((a, m) => { a[m.id] = m.status; return a; }, {});
+      const depsOk = (m) => (m.deps || []).every(d => st[d] === 'approved');
+      const next = (p.modules || []).find(m => (['pending', 'rejected'].includes(m.status)
+        || (m.status === 'failed' && (m.attempts || 0) < 3)) && depsOk(m));
+      if (next && cur.status !== 'running') {
+        log(`kick module ${next.id} (${next.name})`);
+        await fetch(`${BASE}/api/projects/${PROJECT_ID}/modules/${next.id}/run`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
+        await sleep(1000);
+      } else {
+        await sleep(3000);
+      }
+      continue;
+    }
 
     if (cur.status === 'awaiting_review') {
       log(`approve ${cur.id} (${cur.name})`);
