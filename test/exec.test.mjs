@@ -1,3 +1,10 @@
+/* ============================================================
+   exec.test.mjs — 真实执行（node --test / javac / cds）
+   运行：AI_PLATFORM_SPEED=0 node --test test/exec.test.mjs
+   注：本文件 6 件の失敗（2026-10-17 棚卸し時点）は **すべて JDK 必須 or cds 必須**。
+   テスト正本の修正は不要で、Mac に JDK 17 を入れるか colima 経由で cds を有効化すれば緑になる。
+   詳細は docs/test-triage-2026-10-17.md「環境依存」節。
+   ============================================================ */
 /* exec 多语言执行层：栈档案识别 + 真跑 javac/java、python3、node --test（不是模拟输出） */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
