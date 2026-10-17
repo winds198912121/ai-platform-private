@@ -117,6 +117,9 @@ async function callOpenAI(messages, { json, maxTokens, temperature, model, provi
     const budget = attempt === 1 ? maxTokens : MAX_OUT;
     const body = { model, messages, max_tokens: budget, temperature, stream: false };
     if (json) body.response_format = { type: 'json_object' };
+    // 思考量（DeepSeek V4.x / OpenAI o 系が受ける）。既定は送らない＝プロバイダ既定。
+    // AI_PLATFORM_REASONING_EFFORT=none|low|high|max で上書き（ない場合は未送信）。
+    if (process.env.AI_PLATFORM_REASONING_EFFORT) body.reasoning_effort = process.env.AI_PLATFORM_REASONING_EFFORT;
 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
