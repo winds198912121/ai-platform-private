@@ -79,6 +79,7 @@ const routes = [
   ['DELETE', /^\/api\/projects\/([^/]+)\/skills\/([^/]+)$/, (m) => H.removeSkill(H.must(m[1]), m[2])],
   ['POST', /^\/api\/projects\/([^/]+)\/activate$/, (m) => H.activate(m[1])],
   ['POST', /^\/api\/projects\/([^/]+)\/rebuild$/, (m, body) => H.rebuildProject(m[1], { force: body?.force === true })],
+  ['POST', /^\/api\/projects\/([^/]+)\/ledger\/rescan$/, (m, body) => H.rescanLedger(m[1], { replace: body?.replace !== false })],
   ['DELETE', /^\/api\/projects\/([^/]+)$/, (m, body, url) => H.removeProject(m[1], { force: url.searchParams.get('force') === '1' || body.force === true })],
   ['POST', /^\/api\/projects\/([^/]+)\/stages\/([^/]+)\/run$/, (m) => { const p = H.must(m[1]); H.checkStageRunnable(p, m[2]); H.runStage(p, m[2]).catch(e => console.error('[run]', e.message)); return { ok: true }; }],
   ['POST', /^\/api\/projects\/([^/]+)\/stages\/([^/]+)\/approve$/, async (m, body, url, req) => H.approveStage(H.must(m[1]), m[2], body.reviewer, { source: approvalSource(req), ackGaps: body.ack_gaps === true })],

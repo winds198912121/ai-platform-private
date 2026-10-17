@@ -349,3 +349,52 @@ test('疑問ループ：曖昧な ID を持つモジュールは on_hold、回�
   assert.equal(l3.status, 'dismissed');
   assert.equal(H.trace(p).lessons.draft, 0);
 });
+
+/* ---------- ⑩ 台帳再走査 rescanLedger（既存案件の流し直し / 入力差分の反映） ---------- */
+
+test('rescanLedger：入力資料だけから決定的に台帳を作り直し、消えた ID はモジュール req_ids から落ちる', async () => {
+  const p = H.createProject({ name: 'rescan', brief: '車両管理', tech: 'Node.js', files: [{ name: 'spec.md', content: SPEC }] });
+  await waitFor(() => stage(p, 'requirements').status === 'awaiting_review');
+  // 既存台帳に「実際には入力に無い」ID を 1 件紛れ込ませる（モデルが創作した FR / 旧台帳の残り香の想定）
+  p.ledger.items.push({ id: 'GHOST_FR_999', kind: 'requirement', name: '創造された要件', parent: null, refs: 0, sources: [], origin: 'model' });
+  // モジュールの req_ids にも混ぜておく → rescan で落ちるべき
+  p.modules = [{ id: 'M1', name: '車両台帳', layer: 'core', status: 'approved', req_ids: ['Jsh050', 'SHM_SYARYO', 'GHOST_FR_999'] }];
+  const eventsBefore = p.events.length;
+  const r = H.rescanLedger(p.id);
+  assert.ok(r.items >= 6, `ledger items ${r.items}`);
+  assert.equal(r.scanned.files, 1);
+  assert.ok(r.prev_count >= 6, `previous ledger を持つので prev_count > 0 (実際 ${r.prev_count})`);
+  assert.equal(r.dropped, 1, 'GHOST_FR_999 が removed');
+  assert.equal(r.added, 0);
+  // 消えた ID（GHOST_）はモジュールから落ちる、Jsh050 と SHM_SYARYO は残る
+  assert.deepEqual([...p.modules[0].req_ids].sort(), ['Jsh050', 'SHM_SYARYO']);
+  assert.equal(p.modules[0].id, 'M1', 'モジュールは消さない');
+  assert.ok(p.ledger.items.some(it => it.id === 'SHM_SYARYO'), '台帳本体に SHM_SYARYO が入っている');
+  assert.ok(!p.ledger.items.some(it => it.id === 'GHOST_FR_999'), '台帳本体から GHOST_FR_999 は消える');
+  assert.ok(p.ledger.rescan_of, 'previous 生成時刻を rescan_of に保持');
+  assert.ok(p.events.length > eventsBefore, 'rescan イベントが追加される');
+  const rescanEvt = p.events.filter(e => /ledger rescan:/.test(e.text)).pop();
+  assert.match(rescanEvt.text, /−1 removed/, 'GHOST_FR_999 は removed として記録');
+  assert.match(rescanEvt.text, /1 file\(s\)/);
+});
+
+test('rescanLedger：走っている案件は 409（入力ファイル無し）', async () => {
+  const empty = H.createProject({ name: 'rescan-noinput', tech: 'Node.js' });
+  await waitFor(() => stage(empty, 'requirements').status === 'awaiting_review');
+  assert.throws(() => H.rescanLedger(empty.id), (e) => e.status === 400 && /no input files/.test(e.message), '入力無し → 400');
+});
+
+test('rescanLedger：要件段階の実行中は 409', () => {
+  // running 状態を強制して 409 を検証
+  const p = H.createProject({ name: 'rescan-running', brief: '車両', tech: 'Node.js', files: [{ name: 'spec.md', content: SPEC }] });
+  p.stages[0].status = 'running';
+  assert.throws(() => H.rescanLedger(p.id), (e) => e.status === 409, '実行中 → 409');
+});
+
+test('rescanLedger：API ルート POST /api/projects/:id/ledger/rescan がサーバに届く', () => {
+  // ルートファイル内にパスと関数が書かれているかを静的検査（実サーバを起動しない）
+  const src = fs.readFileSync(path.join(process.cwd(), 'server.mjs'), 'utf8');
+  // 正規表現なので `\/` のエスケープを含む。`ledger` と `rescan` の隣接だけ見る
+  assert.ok(/ledger[\\]+\/rescan/.test(src), 'rescan ルートがサーバ.mjs に定義されている');
+  assert.ok(src.includes('H.rescanLedger('), 'ルートから関数が呼ばれる');
+});

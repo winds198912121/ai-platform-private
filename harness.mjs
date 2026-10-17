@@ -841,13 +841,57 @@ export function rebuildProject(id, { force = false } = {}) {
   p.events = [];                       // 历史痕迹清零(紧接着写/重建这一)
   try { stat.dirs = exec.clearWorkspace(id); } catch (e) { stat.dirs = [`(清理failed: ${e.message})`]; }
   save();
-  pushEvent(p, {
+pushEvent(p, {
     stage: 'project', kind: 'rebuild',
     text: `♻ Rebuild: cleared  ${stat.artifacts}  artifact(s), ${stat.modules} modules(${stat.files}  source/test file(s)), ${stat.events} skillsexecuterecords`
-      + `，deleted workspace/${id}/ / ${stat.dirs.length}  generated item(s)${stat.dirs.length ? `(${stat.dirs.join('、')})` : ''}`
+      + ` ，deleted workspace/${id}/ / ${stat.dirs.length}  generated item(s)${stat.dirs.length ? `(${stat.dirs.join('、')})` : ''}`
       + ` ; Skills ${skillsOf(p).length} skills、inputmaterials ${(p.inputs || []).length} retained`,
   });
   return { ok: true, cleared: { ...stat, dirs: stat.dirs.length }, kept: { skills: skillsOf(p).length, inputs: (p.inputs || []).length } };
+}
+
+/** Rescan the requirements ledger from raw input files on disk. Deterministic:
+ *  no model call, so it's safe to run from the UI without paying for re-supplementation.
+ *  Use when inputs have been added/changed outside the loop, or when the project
+ *  predates the ledger feature. The model-supplemented FR/NFR (added by buildLedger)
+ *  is dropped — re-running the requirements stage is the path to get them back.
+ *  Modules whose req_ids point at IDs that no longer exist get those IDs trimmed
+ *  (the modules themselves are kept). Running stages block with 409 to avoid races.
+ */
+export function rescanLedger(id, { replace = true } = {}) {
+  const p = get(id);
+  if (!p) throw new HttpError(404, `Project not found: ${id}`);
+  if ((p.stages || []).some(s => s.status === 'running') || (p.modules || []).some(m => m.status === 'running'))
+    throw new HttpError(409, 'Project is running: wait for it to finish before rescanning the ledger');
+  const files = G.readInputs(p, exec.wsDir(p.id));
+  if (!files.length) throw new HttpError(400, 'no input files on disk — add inputs first, or run the requirements stage');
+  const { items, scanned } = G.scanLedger(files, Array.isArray(p.ledger_patterns) && p.ledger_patterns.length ? p.ledger_patterns : undefined);
+  if (!items.length) throw new HttpError(400, `scan returned 0 IDs from ${scanned.files} file(s) — check inputs or ledger_patterns`);
+  const prevIds = new Set((p.ledger && p.ledger.items ? p.ledger.items : []).map(it => it.id));
+  const nextIds = new Set(items.map(it => it.id));
+  const dropped = [...prevIds].filter(x => !nextIds.has(x));
+  const added = [...nextIds].filter(x => !prevIds.has(x));
+  if (dropped.length && Array.isArray(p.modules)) {
+    for (const m of p.modules) {
+      if (!Array.isArray(m.req_ids) || !m.req_ids.length) continue;
+      const before = m.req_ids.length;
+      m.req_ids = m.req_ids.filter(rid => nextIds.has(rid));
+      const lost = before - m.req_ids.length;
+      if (lost) pushEvent(p, { stage: 'project', kind: 'step', text: `rescanLedger: module ${m.id} dropped ${lost} req_id(s) no longer in input files` });
+    }
+  }
+  p.ledger = { items, scanned, generated_at: now(), rescan_of: p.ledger?.generated_at || null, prev_count: prevIds.size };
+  const by = {};
+  for (const it of items) by[it.kind] = (by[it.kind] || 0) + 1;
+  const delta = added.length || dropped.length
+    ? ` · Δ ${added.length - dropped.length >= 0 ? '+' : ''}${added.length - dropped.length} vs previous (${prevIds.size})${added.length ? ` · +${added.length} added` : ''}${dropped.length ? ` · −${dropped.length} removed` : ''}`
+    : ' · unchanged';
+  pushEvent(p, {
+    stage: 'project', kind: 'artifact',
+    text: `ledger rescan: ${scanned.files} file(s) / ${Math.round(scanned.bytes / 1024)}KB → ${items.length} ID(s) (${Object.entries(by).map(([k, n]) => `${k} ${n}`).join(' / ')})${delta}`,
+  });
+  save();
+  return { items: items.length, scanned, dropped: dropped.length, added: added.length, prev_count: prevIds.size };
 }
 
 /* ---------- execute器 ---------- */
