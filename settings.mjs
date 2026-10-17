@@ -28,8 +28,8 @@ export const PRESETS = [
   {
     id: 'deepseek', name: 'DeepSeek', apiStyle: 'openai',
     baseUrl: 'https://api.deepseek.com/v1',
-    models: ['deepseek-chat', 'deepseek-reasoner'],
-    defaultModel: 'deepseek-chat',
+    models: ['deepseek-flash', 'deepseek-chat', 'deepseek-reasoner'],
+    defaultModel: 'deepseek-flash',          // DeepSeek-V4.1-Flash（api-docs.deepseek.com の最新 flash）
     hint: 'DeepSeek 公式 API。OpenAI 互換プロトコルです。',
   },
   {

@@ -1557,7 +1557,14 @@ function syncDevelopment(p) {
       const n = mods.reduce((a, m) => a + (m.unit_tests?.total || 0), 0);
       pushEvent(p, { stage: 'development', kind: 'gate', text: `✓ All ${mods.length}   module(s) approved · total real unit tests: ${n} tests · Development stage closed → enter integration testing` });
     }
-  } else if (mods.some(m => m.status === 'failed')) st.status = 'failed';
+  } else if (mods.some(m => m.status === 'failed')) {
+    // 「failed が 1 件ある」＝即「開発停止」ではない。まだ走れる/再試行できる余地があれば
+    // 実行中として扱う（UI に「停止」と出て実態と食い違うのを防ぐ）。
+    const canProgress = mods.some(m => m.status === 'running')
+      || mods.some(m => ['pending', 'rejected'].includes(m.status))
+      || mods.some(m => m.status === 'failed' && (m.attempts || 0) < 3);
+    st.status = canProgress ? 'running' : 'failed';
+  }
   else if (mods.some(m => m.status === 'running')) st.status = 'running';
   else if (mods.some(m => m.status === 'awaiting_review' || m.status === 'on_hold')) st.status = 'awaiting_review';   // 人の判断待ち（承認 or 疑問への回答）
   else st.status = 'running';
