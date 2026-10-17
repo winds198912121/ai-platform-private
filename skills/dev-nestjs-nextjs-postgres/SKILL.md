@@ -52,3 +52,20 @@ metadata:
 - [ ] デコレータを使うファイルは reflect-metadata を import し、非クラス注入は @Inject(TOKEN) を使っています。
 - [ ] Next.js の業務ロジックは純粋関数に切り出され、具体値・境界・エラーをテストしています。
 - [ ] 時刻・乱数・ID は注入され、相対 import は拡張子なしです。
+
+## 実運用で踏んだ罠（2026-10 の交通局案件・40 モジュールで実測）
+
+- **DATE 列に `Date#toISOString()` を使わない**。`pg` は DATE を「ローカル深夜」の Date で返すため、
+  UTC 変換すると前日になる（JST の 2024-04-01 → 2024-03-31）。DATE は
+  `getFullYear/getMonth/getDate` で組み立てるか、`pg.types.setTypeParser(1082, v => v)` で文字列のまま受ける。
+- **統合テストはファイルごとに専用スキーマを持つ**。同一 PostgreSQL で `CREATE TABLE IF NOT EXISTS` を
+  共有すると、他モジュールが先に作った別形状のテーブルが残り、列不一致（42703）や NOT NULL 違反（23502）になる。
+  `pool.on('connect', c => { c.query('CREATE SCHEMA IF NOT EXISTS <file-unique>'); c.query('SET search_path TO <file-unique>, public'); })`
+  を必ず入れ、固定 PK を挿すテストは先に `DELETE` する（再実行で 23505）。
+- **テストの CREATE TABLE は実装の INSERT/SELECT と列名・制約を完全一致**させる。
+  `ON CONFLICT` を使うなら対応する UNIQUE 制約を同じテスト内で定義する。
+- **共有モジュールの型は機能追加で消さない**。ある機能が別機能の `csv-types` のような共有型ファイルを
+  上書きすると、他方の import が全て `undefined` になり実行時に初めて壊れる（型チェックは走らない）。
+  共有ファイルを更新するときは既存 export を残す。
+- **NestJS のバリデーション順序**はテストが期待する順序と一致させる（先に別項目で落ちると、
+  期待したエラーメッセージにならない）。入力エラーの MSG コードは段階で統一する（例: MSG010）。
